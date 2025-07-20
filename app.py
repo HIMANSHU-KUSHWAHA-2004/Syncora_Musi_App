@@ -77,8 +77,8 @@ def create_socketio():
             cors_allowed_origins="*",
             logger=False,
             engineio_logger=False,
-            ping_timeout=20,
-            ping_interval=10
+            ping_timeout=10,
+            ping_interval=5
         )
     
     try:
