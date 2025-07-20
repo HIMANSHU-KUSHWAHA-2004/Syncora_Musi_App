@@ -8,14 +8,16 @@ from werkzeug.utils import secure_filename
 import time
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
 app.config['UPLOAD_FOLDER'] = 'static/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-socketio = SocketIO(app, cors_allowed_origins="*", message_queue="redis://<your-redis-host>:6379")
+# Get Redis URL from environment variable or use the provided URL as fallback
+redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:6379')
+socketio = SocketIO(app, cors_allowed_origins="*", message_queue=redis_url)
 
 # Store room data
 rooms = {}
@@ -211,7 +213,6 @@ def handle_disconnect():
                         print(f"⚠️ Error deleting song {song_path}: {e}")
             # Remove the room from memory
             del rooms[room_id]
-   
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=10000)
+    socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
