@@ -13,7 +13,9 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+from flask_socketio import SocketIO
+
+socketio = SocketIO(app, cors_allowed_origins="*", message_queue="redis://red-d1uhscemcj7s73ehu9d0:6379")
 
 # Store room data
 rooms = {}
