@@ -5,7 +5,7 @@ class SyncMusicPlayer {
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
         this.audio.playbackRate = 1.0; // 🔧 FIX: ensure normal speed initially
-        this.syncThreshold = 0.1; // 300ms sync threshold
+        this.syncThreshold = 0.09; // 300ms sync threshold
 
         this.init();
     }
