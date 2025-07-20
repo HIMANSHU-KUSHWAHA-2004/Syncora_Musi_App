@@ -1,6 +1,8 @@
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
+import eventlet
+eventlet.monkey_patch()
 import uuid
 from werkzeug.utils import secure_filename
 import time
