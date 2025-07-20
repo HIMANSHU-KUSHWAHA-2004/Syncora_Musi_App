@@ -22,6 +22,9 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Enhanced Redis configuration for music streaming
+
+
+# Enhanced Redis configuration for music streaming
 def create_redis_connection():
     redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:6379')
     
@@ -37,27 +40,18 @@ def create_redis_connection():
             redis_host = 'red-d1uhscemcj7s73ehu9d0'
             redis_port = 6379
         
-        # Create Redis client with robust settings
+        # Create Redis client with compatible settings (removed redis.Retry)
         redis_client = redis.Redis(
             host=redis_host,
             port=redis_port,
             decode_responses=True,
-            socket_timeout=3,  # Quick timeout for music apps
+            socket_timeout=3,
             socket_connect_timeout=3,
             socket_keepalive=True,
             socket_keepalive_options={},
             retry_on_timeout=True,
-            retry_on_error=[
-                redis.exceptions.ConnectionError,
-                redis.exceptions.TimeoutError,
-                redis.exceptions.BusyLoadingError
-            ],
-            health_check_interval=10,  # Health check every 10 seconds
-            max_connections=30,  # Higher pool for multiple rooms
-            retry=redis.Retry(
-                redis.backoff.ExponentialBackoff(),
-                retries=3
-            )
+            health_check_interval=10,
+            max_connections=30
         )
         
         # Test connection
@@ -69,7 +63,7 @@ def create_redis_connection():
         logger.error(f"❌ Redis connection failed: {e}")
         return None
 
-# Initialize Redis connection
+# Initialize Redis connection FIRST
 redis_client = create_redis_connection()
 
 # Enhanced SocketIO setup with better error handling
@@ -81,7 +75,7 @@ def create_socketio():
         return SocketIO(
             app, 
             cors_allowed_origins="*",
-            logger=False,  # Reduce log spam
+            logger=False,
             engineio_logger=False,
             ping_timeout=20,
             ping_interval=10
@@ -95,14 +89,7 @@ def create_socketio():
             logger=False,
             engineio_logger=False,
             ping_timeout=20,
-            ping_interval=10,
-            # Additional Redis-specific settings
-            redis_options={
-                'socket_timeout': 3,
-                'socket_connect_timeout': 3,
-                'retry_on_timeout': True,
-                'health_check_interval': 10
-            }
+            ping_interval=10
         )
         logger.info(f"✅ SocketIO connected with Redis: {redis_url}")
         return socketio_instance
@@ -118,8 +105,8 @@ def create_socketio():
             ping_interval=10
         )
 
+# Initialize SocketIO AFTER redis_client is defined
 socketio = create_socketio()
-
 # Store room data with Redis backup
 rooms = {}
 
