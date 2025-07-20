@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sync Music Player</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎵 Syncora</h1>
+            <p class="tagline">Stream music together in real‑time, perfectly in sync.</p>
+        </div>
+
+        <div id="home-screen" class="screen active">
+            <div class="card">
+                <div class="setup-header">
+                    <h2>Join or Create Room</h2>
+                    <p>Start streaming music together in perfect sync</p>
+                </div>
+                <button id="create-room-btn" class="btn btn-primary btn-full">Create New Room</button>
+                <div class="divider">OR JOIN EXISTING</div>
+                <div class="input-group">
+                    <label for="room-id-input">Room ID</label>
+                    <input type="text" id="room-id-input" placeholder="Enter 8-character room code" maxlength="8">
+                </div>
+                <div class="input-group">
+                    <label for="room-password-input">Password</label>
+                    <input type="password" id="room-password-input" placeholder="Room password">
+                </div>
+                <button id="join-room-btn" class="btn btn-secondary btn-full">Join Room</button>
+            </div>
+        </div>
+
+        <div id="create-room-screen" class="screen">
+            <div class="card">
+                <div class="setup-header">
+                    <h2>Create Room</h2>
+                    <p>Set up a new synchronized music room</p>
+                </div>
+                <div class="input-group">
+                    <label for="new-room-password">Room Password (Optional)</label>
+                    <input type="password" id="new-room-password" placeholder="Leave empty for public room">
+                </div>
+                <button id="confirm-create-btn" class="btn btn-primary btn-full">Create Room</button>
+                <button id="back-btn" class="btn btn-text">← Back to home</button>
+            </div>
+        </div>
+
+        <div id="player-screen" class="screen">
+            <div class="player-header">
+                <div class="room-info">
+                    <div class="room-id" id="room-id-display">Room: </div>
+                    <div id="host-badge" class="badge">HOST</div>
+                    <div class="clients-count" id="clients-count">1 connected</div>
+                </div>
+                <button id="leave-room-btn" class="btn btn-danger">Leave Room</button>
+            </div>
+
+            <div class="player-card">
+                <div class="current-song">
+                    <div class="song-display">
+                        <div class="song-name" id="song-name">No song selected</div>
+                        <div class="song-status" id="song-status">Ready to play</div>
+                    </div>
+                </div>
+
+                <div class="audio-controls">
+                    <audio id="audio-player" class="audio-player" controls controlsList="nodownload">
+                        Your browser does not support audio playback.
+                    </audio>
+                </div>
+
+                <div class="playback-controls">
+                    <button id="play-btn" class="btn btn-control">▶️ Play</button>
+                    <button id="pause-btn" class="btn btn-control" style="display: none;">⏸️ Pause</button>
+                    <div class="time-display" id="time-display">00:00 / 00:00</div>
+                </div>
+
+                <div id="host-controls" class="host-controls" style="display: none;">
+                    <div class="upload-section">
+                        <h3>📁 Upload Audio File</h3>
+                        <div class="file-upload">
+                            <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.m4a,.flac">
+                            <button id="upload-btn" class="btn btn-secondary">Choose Audio File</button>
+                        </div>
+                        <div id="upload-status"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="error-modal" class="modal">
+            <div class="modal-content">
+                <h3>Error</h3>
+                <p id="error-message"></p>
+                <button id="close-error-btn" class="btn btn-primary">OK</button>
+            </div>
+        </div>
+    </div>
+    <section id="how-to-use" class="how-to-use">
+  <h2>🎧 How to Use</h2>
+  <div class="steps">
+    <div class="step">
+      <h3>1️⃣ Create or Join a Room</h3>
+      <p>Click <strong>Create Room</strong> to start a new room, or enter a room ID and password to <strong>Join Room</strong> with your friends.</p>
+    </div>
+    <div class="step">
+      <h3>2️⃣ Upload Your Song</h3>
+      <p>If you are the host, click <strong>Upload</strong> and choose a music file (MP3, WAV, etc.). It will be instantly available for everyone in the room.</p>
+    </div>
+    <div class="step">
+      <h3>3️⃣ Control Playback</h3>
+      <p>As the host, use the <strong>Play</strong> and <strong>Pause</strong> buttons to control playback. Everyone else will stay in perfect sync.</p>
+    </div>
+    <div class="step">
+      <h3>4️⃣ Seek & Sync</h3>
+      <p>You can scrub through the song, and all participants will jump to the same position together.</p>
+    </div>
+    <div class="step">
+      <h3>5️⃣ Leave the Room</h3>
+      <p>When finished, click <strong>Leave Room</strong>. If you are the host, your uploaded song will be removed from the server to save space.</p>
+    </div>
+  </div>
+  <p class="footer-note">✅ Enjoy listening together with friends in perfect sync!</p>
+</section>
+<footer class="app-footer">
+  <p>🎨 Built with ❤️ by <strong>Himanshu Kushwaha</strong></p>
+  <p class="footer-links">
+    <a href="https://github.com/" target="_blank">GitHub</a> | 
+    <a href="https://www.linkedin.com/" target="_blank">LinkedIn</a> | 
+    <a href="mailto:your-email@example.com">Contact</a>
+  </p>
+</footer>
+
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
