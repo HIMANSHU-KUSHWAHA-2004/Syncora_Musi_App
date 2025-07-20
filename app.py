@@ -17,7 +17,19 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Get Redis URL from environment variable or use the provided URL as fallback
 redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:6379')
-socketio = SocketIO(app, cors_allowed_origins="*", message_queue=redis_url)
+
+# Try to connect to Redis, fallback to no message queue if it fails
+if redis_url == 'none':
+    print("🔄 Running without Redis (single instance mode)")
+    socketio = SocketIO(app, cors_allowed_origins="*")
+else:
+    try:
+        socketio = SocketIO(app, cors_allowed_origins="*", message_queue=redis_url)
+        print(f"✅ Connected to Redis: {redis_url}")
+    except Exception as e:
+        print(f"⚠️ Redis connection failed: {e}")
+        print("🔄 Running without Redis (single instance mode)")
+        socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Store room data
 rooms = {}
