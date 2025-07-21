@@ -21,10 +21,6 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Enhanced Redis configuration for music streaming
-
-
-# Enhanced Redis configuration for music streaming
 def create_redis_connection():
     redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:6379')
     
@@ -32,7 +28,6 @@ def create_redis_connection():
         return None
     
     try:
-        # Parse Redis URL to get connection params
         if redis_url.startswith('redis://'):
             redis_host = redis_url.split('@')[-1].split(':')[0]
             redis_port = int(redis_url.split(':')[-1])
@@ -40,7 +35,6 @@ def create_redis_connection():
             redis_host = 'red-d1uhscemcj7s73ehu9d0'
             redis_port = 6379
         
-        # Create Redis client with compatible settings (removed redis.Retry)
         redis_client = redis.Redis(
             host=redis_host,
             port=redis_port,
@@ -54,7 +48,6 @@ def create_redis_connection():
             max_connections=30
         )
         
-        # Test connection
         redis_client.ping()
         logger.info(f"✅ Redis connection successful: {redis_host}:{redis_port}")
         return redis_client
@@ -63,10 +56,8 @@ def create_redis_connection():
         logger.error(f"❌ Redis connection failed: {e}")
         return None
 
-# Initialize Redis connection FIRST
 redis_client = create_redis_connection()
 
-# Enhanced SocketIO setup with better error handling
 def create_socketio():
     redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:6379')
     
@@ -105,12 +96,14 @@ def create_socketio():
             ping_interval=10
         )
 
-# Initialize SocketIO AFTER redis_client is defined
 socketio = create_socketio()
-# Store room data with Redis backup
 rooms = {}
 
-# Health check endpoint
+# High precision timestamp function
+def get_precise_timestamp():
+    """Get high precision timestamp in milliseconds"""
+    return int(time.time() * 1000)
+
 @app.route('/health')
 def health_check():
     redis_status = "disconnected"
@@ -124,17 +117,17 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'redis': redis_status,
-        'rooms': len(rooms)
+        'rooms': len(rooms),
+        'server_time': get_precise_timestamp()
     }), 200
 
-# Redis helper functions
 def store_room_state(room_id, room_data):
     """Store room state in Redis for persistence"""
     if redis_client:
         try:
             redis_client.setex(
                 f"room:{room_id}", 
-                3600,  # 1 hour expiry
+                3600,
                 str(room_data)
             )
         except Exception as e:
@@ -149,7 +142,6 @@ def get_room_state(room_id):
             logger.warning(f"Failed to get room state from Redis: {e}")
     return None
 
-# Enhanced error handling for critical events
 def emit_with_retry(event, data, room=None, retries=3):
     """Emit with retry logic for critical events"""
     for attempt in range(retries):
@@ -186,26 +178,25 @@ def upload_file():
     
     if file and allowed_file(file.filename):
         filename = secure_filename(file.filename)
-        # Add timestamp to avoid conflicts
         filename = f"{int(time.time())}_{filename}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(file_path)
         
-        # Update room with new song
         if room_id in rooms:
+            timestamp = get_precise_timestamp()
             rooms[room_id]['current_song'] = filename
             rooms[room_id]['position'] = 0
             rooms[room_id]['is_playing'] = False
+            rooms[room_id]['last_update'] = timestamp
             
-            # Store in Redis
             store_room_state(room_id, rooms[room_id])
             
-            # Notify all clients in room with retry
             try:
                 socketio.emit('song_changed', {
                     'song': filename,
                     'position': 0,
-                    'is_playing': False
+                    'is_playing': False,
+                    'timestamp': timestamp
                 }, room=room_id)
                 logger.info(f"Song changed notification sent to room {room_id}")
             except Exception as e:
@@ -225,8 +216,6 @@ def end_session():
         return jsonify({'error': 'Room not found'})
     
     room_data = rooms[room_id]
-    
-    # Delete the uploaded song if any
     current_song = room_data.get('current_song')
     if current_song:
         song_path = os.path.join(app.config['UPLOAD_FOLDER'], current_song)
@@ -235,7 +224,6 @@ def end_session():
                 os.remove(song_path)
                 logger.info(f"✅ Deleted song after session: {song_path}")
                 
-                # Clean up Redis
                 if redis_client:
                     try:
                         redis_client.delete(f"room:{room_id}")
@@ -249,11 +237,24 @@ def end_session():
     
     return jsonify({'success': True, 'message': 'No files to clean up'})
 
-# Rest of your SocketIO events with enhanced error handling...
+# Enhanced sync endpoint for time synchronization
+@app.route('/sync_time', methods=['GET'])
+def sync_time():
+    """Endpoint for clients to sync their time with server"""
+    return jsonify({
+        'server_time': get_precise_timestamp()
+    })
+
+@socketio.on('ping_sync')
+def handle_ping_sync():
+    """Handle ping for latency measurement"""
+    emit('pong_sync', {'server_time': get_precise_timestamp()})
+
 @socketio.on('create_room')
 def handle_create_room(data):
     room_id = str(uuid.uuid4())[:8]
     password = data.get('password', '')
+    timestamp = get_precise_timestamp()
     
     rooms[room_id] = {
         'host': request.sid,
@@ -262,21 +263,24 @@ def handle_create_room(data):
         'current_song': None,
         'position': 0,
         'is_playing': False,
-        'last_update': time.time()
+        'last_update': timestamp,
+        'play_start_time': None,
+        'sync_interval': 1000  # Sync every 1 second
     }
     
     join_room(room_id)
     rooms[room_id]['clients'].append({
         'id': request.sid,
-        'is_host': True
+        'is_host': True,
+        'latency': 0
     })
     
-    # Store in Redis
     store_room_state(room_id, rooms[room_id])
     
     emit('room_created', {
         'room_id': room_id,
-        'is_host': True
+        'is_host': True,
+        'server_time': timestamp
     })
     
     logger.info(f"Room created: {room_id}")
@@ -295,29 +299,49 @@ def handle_join_room(data):
         return
     
     join_room(room_id)
+    timestamp = get_precise_timestamp()
+    
     rooms[room_id]['clients'].append({
         'id': request.sid,
-        'is_host': False
+        'is_host': False,
+        'latency': 0
     })
     
-    # Store updated state
     store_room_state(room_id, rooms[room_id])
     
-    # Send current state to new client
+    # Calculate current position if playing
+    current_position = rooms[room_id]['position']
+    if rooms[room_id]['is_playing'] and rooms[room_id]['play_start_time']:
+        elapsed = (timestamp - rooms[room_id]['play_start_time']) / 1000.0
+        current_position += elapsed
+    
     emit('room_joined', {
         'room_id': room_id,
         'is_host': False,
         'current_song': rooms[room_id]['current_song'],
-        'position': rooms[room_id]['position'],
-        'is_playing': rooms[room_id]['is_playing']
+        'position': current_position,
+        'is_playing': rooms[room_id]['is_playing'],
+        'server_time': timestamp,
+        'last_update': rooms[room_id]['last_update']
     })
     
-    # Update client list for all users with retry
     emit_with_retry('clients_updated', {
         'clients': len(rooms[room_id]['clients'])
     }, room=room_id)
     
     logger.info(f"Client joined room {room_id}")
+
+@socketio.on('update_latency')
+def handle_update_latency(data):
+    """Update client latency for better sync"""
+    room_id = data.get('room_id')
+    latency = data.get('latency', 0)
+    
+    if room_id in rooms:
+        for client in rooms[room_id]['clients']:
+            if client['id'] == request.sid:
+                client['latency'] = latency
+                break
 
 @socketio.on('play_pause')
 def handle_play_pause(data):
@@ -326,19 +350,31 @@ def handle_play_pause(data):
     if room_id not in rooms or rooms[room_id]['host'] != request.sid:
         return
     
-    rooms[room_id]['is_playing'] = data.get('is_playing')
-    rooms[room_id]['position'] = data.get('position', 0)
-    rooms[room_id]['last_update'] = time.time()
+    timestamp = get_precise_timestamp()
+    is_playing = data.get('is_playing')
+    position = data.get('position', 0)
     
-    # Store updated state
+    rooms[room_id]['is_playing'] = is_playing
+    rooms[room_id]['position'] = position
+    rooms[room_id]['last_update'] = timestamp
+    
+    if is_playing:
+        rooms[room_id]['play_start_time'] = timestamp
+    else:
+        rooms[room_id]['play_start_time'] = None
+    
     store_room_state(room_id, rooms[room_id])
     
-    # Critical sync event - use retry
-    emit_with_retry('sync_playback', {
-        'is_playing': rooms[room_id]['is_playing'],
-        'position': rooms[room_id]['position'],
-        'timestamp': rooms[room_id]['last_update']
-    }, room=room_id)
+    # Emit with precise timing
+    sync_data = {
+        'is_playing': is_playing,
+        'position': position,
+        'timestamp': timestamp,
+        'play_start_time': rooms[room_id]['play_start_time']
+    }
+    
+    emit_with_retry('sync_playback', sync_data, room=room_id)
+    logger.info(f"Play/Pause sync sent for room {room_id}: playing={is_playing}, pos={position}")
 
 @socketio.on('seek')
 def handle_seek(data):
@@ -347,62 +383,72 @@ def handle_seek(data):
     if room_id not in rooms or rooms[room_id]['host'] != request.sid:
         return
     
-    rooms[room_id]['position'] = data.get('position', 0)
-    rooms[room_id]['last_update'] = time.time()
+    timestamp = get_precise_timestamp()
+    position = data.get('position', 0)
     
-    # Store updated state
+    rooms[room_id]['position'] = position
+    rooms[room_id]['last_update'] = timestamp
+    
+    # Reset play start time if currently playing
+    if rooms[room_id]['is_playing']:
+        rooms[room_id]['play_start_time'] = timestamp
+    
     store_room_state(room_id, rooms[room_id])
     
-    # Critical sync event - use retry
-    emit_with_retry('sync_seek', {
-        'position': rooms[room_id]['position'],
-        'timestamp': rooms[room_id]['last_update']
-    }, room=room_id)
+    sync_data = {
+        'position': position,
+        'timestamp': timestamp,
+        'is_playing': rooms[room_id]['is_playing'],
+        'play_start_time': rooms[room_id]['play_start_time']
+    }
+    
+    emit_with_retry('sync_seek', sync_data, room=room_id)
+    logger.info(f"Seek sync sent for room {room_id}: pos={position}")
 
-# In your socket event handler
-@socketio.on('sync_playback')
-def handle_sync(data):
-    position = data.get('position', 0)
-    duration = data.get('duration', 0)
+@socketio.on('request_sync')
+def handle_request_sync(data):
+    """Handle explicit sync requests from clients"""
+    room_id = data.get('room_id')
     
-    # Validate position
-    if duration > 0 and position > duration:
-        position = duration - 0.1
-        data['position'] = position
+    if room_id not in rooms:
+        return
     
-    if position < 0:
-        position = 0
-        data['position'] = position
+    room_data = rooms[room_id]
+    timestamp = get_precise_timestamp()
     
-    emit('sync_playback', data, room=data['room_id'], include_self=False)
+    # Calculate current position
+    current_position = room_data['position']
+    if room_data['is_playing'] and room_data['play_start_time']:
+        elapsed = (timestamp - room_data['play_start_time']) / 1000.0
+        current_position += elapsed
+    
+    emit('force_sync', {
+        'position': current_position,
+        'is_playing': room_data['is_playing'],
+        'timestamp': timestamp,
+        'play_start_time': room_data['play_start_time']
+    })
+
 @socketio.on('disconnect')
-
 def handle_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
     
-    # We make a list of room IDs to avoid modifying dict while iterating
     for room_id in list(rooms.keys()):
         room_data = rooms[room_id]
-        # Remove this client from the room's client list
-        room_data['clients'] = [c for c in room_data['clients'] if c['id'] != request.sid]
+        rooms[room_id]['clients'] = [c for c in room_data['clients'] if c['id'] != request.sid]
 
-        # If the host left, assign a new host
         if room_data['host'] == request.sid:
             if room_data['clients']:
-                # Promote first remaining client to host
                 new_host = room_data['clients'][0]
                 rooms[room_id]['host'] = new_host['id']
                 new_host['is_host'] = True
                 
-                # Store updated state
                 store_room_state(room_id, rooms[room_id])
                 
                 emit('new_host', {'is_host': True}, room=new_host['id'])
                 logger.info(f"New host assigned in room {room_id}: {new_host['id']}")
 
-        # If no clients remain in this room, clean up
         if not room_data['clients']:
-            # Delete the uploaded song if any
             current_song = room_data.get('current_song')
             if current_song:
                 song_path = os.path.join(app.config['UPLOAD_FOLDER'], current_song)
@@ -413,14 +459,12 @@ def handle_disconnect():
                     except Exception as e:
                         logger.error(f"⚠️ Error deleting song {song_path}: {e}")
             
-            # Clean up Redis
             if redis_client:
                 try:
                     redis_client.delete(f"room:{room_id}")
                 except Exception as e:
                     logger.warning(f"Failed to clean Redis room data: {e}")
             
-            # Remove the room from memory
             del rooms[room_id]
             logger.info(f"Room cleaned up: {room_id}")
 
