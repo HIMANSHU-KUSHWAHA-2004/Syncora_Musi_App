@@ -5,13 +5,25 @@ class SyncMusicPlayer {
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
         this.audio.playbackRate = 1.0;
-        this.syncThreshold = 0.5; // Increased from 0.09s to 0.5s to reduce frequent syncing
+        this.syncThreshold = 0.2; // Balanced threshold - not too sensitive, not too loose
         
-        // Add sync control flags
+        // Enhanced sync control
         this.isSyncing = false;
         this.lastSyncTime = 0;
-        this.syncCooldown = 1000; // 1 second cooldown between syncs
+        this.syncCooldown = 500; // Reduced cooldown for more frequent but controlled syncing
         this.isManualSeek = false;
+        
+        // Network latency compensation
+        this.networkOffset = 0;
+        this.pingInterval = null;
+        this.lastPingTime = 0;
+        
+        // Sync monitoring for debugging
+        this.syncStats = {
+            totalSyncs: 0,
+            avgDrift: 0,
+            maxDrift: 0
+        };
         
         this.init();
     }
@@ -19,6 +31,30 @@ class SyncMusicPlayer {
     init() {
         this.setupEventListeners();
         this.setupSocketEvents();
+        this.startNetworkLatencyMeasurement();
+        this.startSyncMonitoring();
+    }
+
+    // Network latency measurement for better sync
+    startNetworkLatencyMeasurement() {
+        this.pingInterval = setInterval(() => {
+            this.lastPingTime = Date.now();
+            this.socket.emit('ping');
+        }, 5000); // Ping every 5 seconds
+    }
+
+    // Continuous sync monitoring for non-hosts
+    startSyncMonitoring() {
+        if (!this.isHost) {
+            setInterval(() => {
+                if (this.currentRoom && !this.audio.paused) {
+                    this.socket.emit('request_sync', {
+                        room_id: this.currentRoom,
+                        current_position: this.audio.currentTime
+                    });
+                }
+            }, 2000); // Request sync every 2 seconds during playback
+        }
     }
 
     setupEventListeners() {
@@ -61,7 +97,7 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
-        // Audio events - Fixed to prevent sync loops
+        // Enhanced audio events
         this.audio.addEventListener('loadedmetadata', () => {
             this.updateTimeDisplay();
             this.audio.playbackRate = 1.0;
@@ -71,19 +107,40 @@ class SyncMusicPlayer {
             this.updateTimeDisplay();
         });
 
-        // Fixed: Only emit seek if it's a manual seek, not a sync-induced seek
+        // Better seek handling
         this.audio.addEventListener('seeking', () => {
             this.isManualSeek = true;
         });
 
         this.audio.addEventListener('seeked', () => {
             if (this.isHost && this.isManualSeek && !this.isSyncing) {
+                // Broadcast seek immediately with timestamp
                 this.socket.emit('seek', {
+                    room_id: this.currentRoom,
+                    position: this.audio.currentTime,
+                    timestamp: Date.now()
+                });
+            }
+            this.isManualSeek = false;
+        });
+
+        // Handle audio stalling/buffering
+        this.audio.addEventListener('waiting', () => {
+            if (this.isHost) {
+                this.socket.emit('host_buffering', {
                     room_id: this.currentRoom,
                     position: this.audio.currentTime
                 });
             }
-            this.isManualSeek = false;
+        });
+
+        this.audio.addEventListener('canplaythrough', () => {
+            if (this.isHost) {
+                this.socket.emit('host_ready', {
+                    room_id: this.currentRoom,
+                    position: this.audio.currentTime
+                });
+            }
         });
 
         // Error modal
@@ -106,6 +163,13 @@ class SyncMusicPlayer {
     }
 
     setupSocketEvents() {
+        // Latency measurement
+        this.socket.on('pong', () => {
+            const latency = (Date.now() - this.lastPingTime) / 2;
+            this.networkOffset = latency;
+            console.log(`Network latency: ${latency}ms`);
+        });
+
         this.socket.on('room_created', (data) => {
             this.currentRoom = data.room_id;
             this.isHost = data.is_host;
@@ -119,7 +183,8 @@ class SyncMusicPlayer {
 
             if (data.current_song) {
                 this.loadSong(data.current_song);
-                this.syncToPosition(data.position, data.is_playing);
+                // Enhanced initial sync with server timestamp
+                this.performTimestampedSync(data.position, data.is_playing, data.timestamp);
             }
         });
 
@@ -129,24 +194,39 @@ class SyncMusicPlayer {
 
         this.socket.on('song_changed', (data) => {
             this.loadSong(data.song);
-            this.syncToPosition(data.position, data.is_playing);
+            this.performTimestampedSync(data.position, data.is_playing, data.timestamp);
         });
 
-        // Fixed: Better sync handling with debouncing
+        // Enhanced sync with timestamp compensation
         this.socket.on('sync_playback', (data) => {
-            if (this.isHost) return; // Host shouldn't sync to itself
-            
-            const now = Date.now();
-            if (now - this.lastSyncTime < this.syncCooldown) {
-                return; // Skip sync if within cooldown period
-            }
-            
-            this.syncToPosition(data.position, data.is_playing);
+            if (this.isHost) return;
+            this.performTimestampedSync(data.position, data.is_playing, data.timestamp);
         });
 
         this.socket.on('sync_seek', (data) => {
-            if (this.isHost) return; // Host shouldn't sync to itself
-            this.syncToPosition(data.position, null); // Don't change play state on seek
+            if (this.isHost) return;
+            this.performTimestampedSync(data.position, null, data.timestamp);
+        });
+
+        // Handle buffering events
+        this.socket.on('host_buffering', () => {
+            if (!this.isHost && !this.audio.paused) {
+                this.audio.pause();
+                this.updatePlayButton(false);
+            }
+        });
+
+        this.socket.on('host_ready', (data) => {
+            if (!this.isHost) {
+                this.performTimestampedSync(data.position, true, data.timestamp);
+            }
+        });
+
+        // Continuous sync response
+        this.socket.on('sync_response', (data) => {
+            if (!this.isHost) {
+                this.performGentleSync(data.position, data.is_playing);
+            }
         });
 
         this.socket.on('clients_updated', (data) => {
@@ -157,21 +237,39 @@ class SyncMusicPlayer {
         this.socket.on('new_host', (data) => {
             this.isHost = data.is_host;
             this.updateHostControls();
+            if (this.isHost) {
+                clearInterval(this.syncMonitorInterval);
+            } else {
+                this.startSyncMonitoring();
+            }
         });
     }
 
-    // New method to handle position syncing safely
-    syncToPosition(targetPosition, shouldPlay = null) {
-        if (this.isSyncing) return; // Prevent nested syncing
+    // Enhanced sync with timestamp compensation
+    performTimestampedSync(targetPosition, shouldPlay, serverTimestamp) {
+        if (this.isSyncing) return;
         
         this.isSyncing = true;
         this.lastSyncTime = Date.now();
         
-        const timeDiff = Math.abs(this.audio.currentTime - targetPosition);
+        // Calculate time elapsed since server sent the position
+        const networkDelay = this.networkOffset;
+        const timeSinceUpdate = (Date.now() - serverTimestamp) / 1000;
+        const compensatedPosition = targetPosition + timeSinceUpdate + (networkDelay / 1000);
         
-        // Only sync if difference is significant
-        if (timeDiff > this.syncThreshold) {
-            this.audio.currentTime = targetPosition;
+        const currentPos = this.audio.currentTime;
+        const timeDiff = Math.abs(currentPos - compensatedPosition);
+        
+        // Update sync statistics
+        this.updateSyncStats(timeDiff);
+        
+        console.log(`Sync: Current=${currentPos.toFixed(2)}, Target=${compensatedPosition.toFixed(2)}, Diff=${timeDiff.toFixed(3)}s`);
+        
+        // Use different thresholds based on playback state
+        const threshold = shouldPlay ? this.syncThreshold : this.syncThreshold * 0.5;
+        
+        if (timeDiff > threshold) {
+            this.audio.currentTime = compensatedPosition;
         }
         
         this.audio.playbackRate = 1.0;
@@ -186,10 +284,47 @@ class SyncMusicPlayer {
             }
         }
         
-        // Reset sync flag after a short delay
         setTimeout(() => {
             this.isSyncing = false;
         }, 100);
+    }
+
+    // Gentle sync for continuous monitoring (smaller corrections)
+    performGentleSync(targetPosition, shouldPlay) {
+        if (this.isSyncing) return;
+        
+        const currentPos = this.audio.currentTime;
+        const timeDiff = Math.abs(currentPos - targetPosition);
+        
+        // Only make small adjustments for gentle sync
+        if (timeDiff > 0.1 && timeDiff < 1.0) {
+            // Gradual correction using playback rate adjustment
+            if (currentPos < targetPosition) {
+                this.audio.playbackRate = 1.05; // Speed up slightly
+            } else {
+                this.audio.playbackRate = 0.95; // Slow down slightly
+            }
+            
+            // Reset to normal speed after correction
+            setTimeout(() => {
+                this.audio.playbackRate = 1.0;
+            }, 1000);
+        } else if (timeDiff >= 1.0) {
+            // Large difference, do immediate sync
+            this.performTimestampedSync(targetPosition, shouldPlay, Date.now());
+        }
+    }
+
+    // Track sync statistics for monitoring
+    updateSyncStats(drift) {
+        this.syncStats.totalSyncs++;
+        this.syncStats.avgDrift = ((this.syncStats.avgDrift * (this.syncStats.totalSyncs - 1)) + drift) / this.syncStats.totalSyncs;
+        this.syncStats.maxDrift = Math.max(this.syncStats.maxDrift, drift);
+        
+        // Log stats every 10 syncs
+        if (this.syncStats.totalSyncs % 10 === 0) {
+            console.log(`Sync Stats - Total: ${this.syncStats.totalSyncs}, Avg Drift: ${this.syncStats.avgDrift.toFixed(3)}s, Max Drift: ${this.syncStats.maxDrift.toFixed(3)}s`);
+        }
     }
 
     showScreen(screenId) {
@@ -236,6 +371,13 @@ class SyncMusicPlayer {
         this.currentRoom = null;
         this.isHost = false;
         this.isSyncing = false;
+        
+        // Cleanup intervals
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
+        
         this.audio.pause();
         this.audio.src = '';
         this.showScreen('home-screen');
@@ -270,10 +412,12 @@ class SyncMusicPlayer {
         this.audio.playbackRate = 1.0;
         this.audio.play().then(() => {
             this.updatePlayButton(true);
+            // Send play command with precise timestamp
             this.socket.emit('play_pause', {
                 room_id: this.currentRoom,
                 is_playing: true,
-                position: this.audio.currentTime
+                position: this.audio.currentTime,
+                timestamp: Date.now()
             });
         }).catch(console.error);
     }
@@ -287,7 +431,8 @@ class SyncMusicPlayer {
         this.socket.emit('play_pause', {
             room_id: this.currentRoom,
             is_playing: false,
-            position: this.audio.currentTime
+            position: this.audio.currentTime,
+            timestamp: Date.now()
         });
     }
 
