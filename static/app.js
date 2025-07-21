@@ -5,16 +5,13 @@ class SyncMusicPlayer {
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
         this.audio.playbackRate = 1.0;
-        this.syncThreshold = 0.2; // 200ms sync threshold (more reasonable)
-        
-        // Synchronization state
+
+        this.syncThreshold = 0.1; // 100ms
         this.lastSyncTime = 0;
         this.syncInterval = null;
         this.pendingSeek = false;
         this.serverTimeOffset = 0;
-        
-        // Debounce for sync events
-        this.syncDebounceTimeout = null;
+        this.offsetRecalcInterval = null;
 
         this.init();
     }
@@ -23,16 +20,18 @@ class SyncMusicPlayer {
         this.setupEventListeners();
         this.setupSocketEvents();
         this.calculateServerTimeOffset();
+        this.offsetRecalcInterval = setInterval(() => {
+            this.calculateServerTimeOffset();
+        }, 30000);
     }
 
-    // Calculate server time offset for better sync
     async calculateServerTimeOffset() {
         try {
             const start = Date.now();
             const response = await fetch('/api/time');
             const end = Date.now();
             const data = await response.json();
-            
+
             const networkDelay = (end - start) / 2;
             this.serverTimeOffset = data.server_time - (start + networkDelay);
         } catch (error) {
@@ -46,7 +45,6 @@ class SyncMusicPlayer {
     }
 
     setupEventListeners() {
-        // Navigation
         document.getElementById('create-room-btn').addEventListener('click', () => {
             this.showScreen('create-room-screen');
         });
@@ -67,7 +65,6 @@ class SyncMusicPlayer {
             this.leaveRoom();
         });
 
-        // Audio controls
         document.getElementById('play-btn').addEventListener('click', () => {
             this.play();
         });
@@ -76,7 +73,6 @@ class SyncMusicPlayer {
             this.pause();
         });
 
-        // File upload
         document.getElementById('upload-btn').addEventListener('click', () => {
             document.getElementById('file-input').click();
         });
@@ -85,7 +81,6 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
-        // Audio events
         this.audio.addEventListener('loadedmetadata', () => {
             this.updateTimeDisplay();
             this.audio.playbackRate = 1.0;
@@ -116,12 +111,10 @@ class SyncMusicPlayer {
             this.showError('Audio playback error occurred');
         });
 
-        // Error modal
         document.getElementById('close-error-btn').addEventListener('click', () => {
             this.hideModal();
         });
 
-        // Enter key support
         document.getElementById('room-id-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') this.joinRoom();
         });
@@ -150,8 +143,9 @@ class SyncMusicPlayer {
 
             if (data.current_song) {
                 this.loadSong(data.current_song).then(() => {
-                    // Wait for audio to be ready before syncing
-                    this.syncToState(data);
+                    this.audio.addEventListener('canplay', () => {
+                        this.syncToState(data);
+                    }, { once: true });
                 });
             }
 
@@ -166,20 +160,20 @@ class SyncMusicPlayer {
 
         this.socket.on('song_changed', (data) => {
             this.loadSong(data.song).then(() => {
-                this.syncToState(data);
+                this.audio.addEventListener('canplay', () => {
+                    this.syncToState(data);
+                }, { once: true });
             });
         });
 
         this.socket.on('sync_playback', (data) => {
-            if (this.isHost) return; // Host doesn't sync to others
-
+            if (this.isHost) return;
             this.syncToState(data);
         });
 
         this.socket.on('sync_seek', (data) => {
             this.pendingSeek = true;
             this.audio.currentTime = data.position;
-            console.log('Synced seek to position:', data.position);
         });
 
         this.socket.on('clients_updated', (data) => {
@@ -191,7 +185,6 @@ class SyncMusicPlayer {
             const wasHost = this.isHost;
             this.isHost = data.is_host;
             this.updateHostControls();
-            
             if (this.isHost && !wasHost) {
                 this.startSyncLoop();
             } else if (!this.isHost && wasHost) {
@@ -199,7 +192,6 @@ class SyncMusicPlayer {
             }
         });
 
-        // Handle disconnection
         this.socket.on('disconnect', () => {
             console.log('Disconnected from server');
             this.stopSyncLoop();
@@ -208,35 +200,38 @@ class SyncMusicPlayer {
         this.socket.on('reconnect', () => {
             console.log('Reconnected to server');
             if (this.currentRoom) {
-                // Rejoin room on reconnect
                 this.socket.emit('rejoin_room', { room_id: this.currentRoom });
             }
         });
     }
 
-    // Sync to a given state from server
     syncToState(data) {
         if (!this.audio.src) return;
 
         const currentTime = this.getServerTime();
         let targetPosition = data.position;
 
-        // If we have timestamp data, calculate where we should be now
         if (data.timestamp && data.is_playing) {
             const timeDiff = (currentTime - data.timestamp) / 1000;
             targetPosition += timeDiff;
         }
 
-        // Only sync if we're significantly off
-        const timeDifference = Math.abs(this.audio.currentTime - targetPosition);
-        
-        if (timeDifference > this.syncThreshold) {
-            console.log(`Syncing: Current=${this.audio.currentTime.toFixed(2)}, Target=${targetPosition.toFixed(2)}, Diff=${timeDifference.toFixed(2)}`);
+        const diff = targetPosition - this.audio.currentTime;
+
+        if (Math.abs(diff) > this.syncThreshold) {
             this.pendingSeek = true;
             this.audio.currentTime = targetPosition;
+        } else {
+            if (!this.audio.paused && data.is_playing) {
+                const adjust = diff * 0.05;
+                this.audio.playbackRate = 1.0 + adjust;
+                clearTimeout(this._resetRateTimer);
+                this._resetRateTimer = setTimeout(() => {
+                    this.audio.playbackRate = 1.0;
+                }, 200);
+            }
         }
 
-        // Sync play state
         if (data.is_playing && this.audio.paused) {
             this.audio.play().catch(e => console.error('Play failed:', e));
             this.updatePlayButton(true);
@@ -246,17 +241,14 @@ class SyncMusicPlayer {
         }
     }
 
-    // Start periodic sync for host
     startSyncLoop() {
         if (!this.isHost) return;
-        
-        this.stopSyncLoop(); // Clear any existing loop
-        
+        this.stopSyncLoop();
         this.syncInterval = setInterval(() => {
-            if (this.currentRoom && this.audio.src && !this.audio.paused) {
+            if (this.currentRoom && this.audio.src) {
                 this.broadcastSync();
             }
-        }, 1000); // Sync every second for smooth experience
+        }, 250);
     }
 
     stopSyncLoop() {
@@ -266,24 +258,19 @@ class SyncMusicPlayer {
         }
     }
 
-    // Broadcast current playback state
     broadcastSync() {
         if (!this.isHost) return;
-
         const syncData = {
             room_id: this.currentRoom,
             position: this.audio.currentTime,
             is_playing: !this.audio.paused,
             timestamp: this.getServerTime()
         };
-
         this.socket.emit('sync_playback', syncData);
     }
 
-    // Broadcast seek position
     broadcastSeek() {
         if (!this.isHost) return;
-
         this.socket.emit('seek', {
             room_id: this.currentRoom,
             position: this.audio.currentTime,
@@ -306,32 +293,21 @@ class SyncMusicPlayer {
     joinRoom() {
         const roomId = document.getElementById('room-id-input').value.trim();
         const password = document.getElementById('room-password-input').value;
-
         if (!roomId) {
             this.showError('Please enter a room ID');
             return;
         }
-
-        this.socket.emit('join_room', {
-            room_id: roomId,
-            password: password
-        });
+        this.socket.emit('join_room', { room_id: roomId, password: password });
     }
 
     leaveRoom() {
         this.stopSyncLoop();
-
         if (this.isHost && this.currentRoom) {
             fetch('/end_session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ room_id: this.currentRoom })
-            })
-                .then(res => res.json())
-                .then(data => {
-                    console.log('✅ Cleanup result:', data);
-                })
-                .catch(err => console.error('❌ Error cleaning up session:', err));
+            }).catch(err => console.error('❌ Error cleaning up session:', err));
         }
 
         this.currentRoom = null;
@@ -354,7 +330,6 @@ class SyncMusicPlayer {
     updateHostControls() {
         const hostControls = document.getElementById('host-controls');
         const hostBadge = document.getElementById('host-badge');
-
         if (this.isHost) {
             hostControls.style.display = 'block';
             hostBadge.style.display = 'inline';
@@ -366,7 +341,6 @@ class SyncMusicPlayer {
 
     play() {
         if (!this.isHost) return;
-
         this.audio.play().then(() => {
             this.updatePlayButton(true);
             this.broadcastSync();
@@ -378,7 +352,6 @@ class SyncMusicPlayer {
 
     pause() {
         if (!this.isHost) return;
-
         this.audio.pause();
         this.updatePlayButton(false);
         this.broadcastSync();
@@ -387,7 +360,6 @@ class SyncMusicPlayer {
     updatePlayButton(isPlaying) {
         const playBtn = document.getElementById('play-btn');
         const pauseBtn = document.getElementById('pause-btn');
-
         if (isPlaying) {
             playBtn.style.display = 'none';
             pauseBtn.style.display = 'inline-block';
@@ -401,14 +373,14 @@ class SyncMusicPlayer {
         return new Promise((resolve, reject) => {
             this.audio.src = `/static/uploads/${filename}`;
             this.audio.playbackRate = 1.0;
-            
+
             const onLoad = () => {
                 document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
                 this.audio.removeEventListener('loadeddata', onLoad);
                 this.audio.removeEventListener('error', onError);
                 resolve();
             };
-            
+
             const onError = (e) => {
                 this.audio.removeEventListener('loadeddata', onLoad);
                 this.audio.removeEventListener('error', onError);
@@ -484,7 +456,6 @@ class SyncMusicPlayer {
     }
 }
 
-// Initialize the app
 document.addEventListener('DOMContentLoaded', () => {
     new SyncMusicPlayer();
 });
