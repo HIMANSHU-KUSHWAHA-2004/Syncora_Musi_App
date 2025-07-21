@@ -359,7 +359,24 @@ def handle_seek(data):
         'timestamp': rooms[room_id]['last_update']
     }, room=room_id)
 
+# In your socket event handler
+@socketio.on('sync_playback')
+def handle_sync(data):
+    position = data.get('position', 0)
+    duration = data.get('duration', 0)
+    
+    # Validate position
+    if duration > 0 and position > duration:
+        position = duration - 0.1
+        data['position'] = position
+    
+    if position < 0:
+        position = 0
+        data['position'] = position
+    
+    emit('sync_playback', data, room=data['room_id'], include_self=False)
 @socketio.on('disconnect')
+
 def handle_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
     

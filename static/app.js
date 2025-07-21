@@ -28,13 +28,28 @@ class SyncMusicPlayer {
     // Calculate server time offset for better sync
     async calculateServerTimeOffset() {
         try {
-            const start = Date.now();
-            const response = await fetch('/api/time');
-            const end = Date.now();
-            const data = await response.json();
+            const measurements = [];
             
-            const networkDelay = (end - start) / 2;
-            this.serverTimeOffset = data.server_time - (start + networkDelay);
+            // Take multiple measurements for accuracy
+            for (let i = 0; i < 3; i++) {
+                const start = Date.now();
+                const response = await fetch('/api/time');
+                const end = Date.now();
+                const data = await response.json();
+                
+                const networkDelay = (end - start) / 2;
+                const offset = data.server_time - (start + networkDelay);
+                measurements.push(offset);
+                
+                // Small delay between measurements
+                if (i < 2) await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            
+            // Use median to avoid outliers
+            measurements.sort((a, b) => a - b);
+            this.serverTimeOffset = measurements[1];
+            console.log('Server time offset calculated:', this.serverTimeOffset, 'ms');
+            
         } catch (error) {
             console.warn('Could not calculate server time offset:', error);
             this.serverTimeOffset = 0;
@@ -150,8 +165,20 @@ class SyncMusicPlayer {
 
             if (data.current_song) {
                 this.loadSong(data.current_song).then(() => {
-                    // Wait for audio to be ready before syncing
-                    this.syncToState(data);
+                    // 🔧 FIX: Add delay and validation before syncing
+                    setTimeout(() => {
+                        if (this.audio.duration && !isNaN(this.audio.duration)) {
+                            this.syncToState(data);
+                        } else {
+                            console.warn('Audio not ready for sync, retrying...');
+                            // Retry sync after audio is loaded
+                            this.audio.addEventListener('loadeddata', () => {
+                                this.syncToState(data);
+                            }, { once: true });
+                        }
+                    }, 200); // Small delay to ensure audio is ready
+                }).catch(error => {
+                    console.error('Error loading song:', error);
                 });
             }
 
@@ -166,7 +193,14 @@ class SyncMusicPlayer {
 
         this.socket.on('song_changed', (data) => {
             this.loadSong(data.song).then(() => {
-                this.syncToState(data);
+                // 🔧 FIX: Ensure audio is fully loaded before syncing
+                setTimeout(() => {
+                    if (this.audio.duration && !isNaN(this.audio.duration)) {
+                        this.syncToState(data);
+                    }
+                }, 300);
+            }).catch(error => {
+                console.error('Error loading new song:', error);
             });
         });
 
@@ -177,9 +211,14 @@ class SyncMusicPlayer {
         });
 
         this.socket.on('sync_seek', (data) => {
-            this.pendingSeek = true;
-            this.audio.currentTime = data.position;
-            console.log('Synced seek to position:', data.position);
+            // 🔧 FIX: Validate seek position before applying
+            if (data.position >= 0 && data.position <= this.audio.duration) {
+                this.pendingSeek = true;
+                this.audio.currentTime = data.position;
+                console.log('Synced seek to position:', data.position);
+            } else {
+                console.warn('Invalid seek position received:', data.position, 'Duration:', this.audio.duration);
+            }
         });
 
         this.socket.on('clients_updated', (data) => {
@@ -216,7 +255,7 @@ class SyncMusicPlayer {
 
     // Sync to a given state from server
     syncToState(data) {
-        if (!this.audio.src) return;
+        if (!this.audio.src || !this.audio.duration) return;
 
         const currentTime = this.getServerTime();
         let targetPosition = data.position;
@@ -227,11 +266,22 @@ class SyncMusicPlayer {
             targetPosition += timeDiff;
         }
 
+        // 🔧 CRITICAL FIX: Prevent jumping beyond song duration
+        if (targetPosition > this.audio.duration) {
+            console.warn(`Target position ${targetPosition.toFixed(2)} exceeds duration ${this.audio.duration.toFixed(2)}, clamping`);
+            targetPosition = this.audio.duration - 0.1; // Small buffer
+        }
+        
+        if (targetPosition < 0) {
+            console.warn(`Target position ${targetPosition.toFixed(2)} is negative, setting to 0`);
+            targetPosition = 0;
+        }
+
         // Only sync if we're significantly off
         const timeDifference = Math.abs(this.audio.currentTime - targetPosition);
         
         if (timeDifference > this.syncThreshold) {
-            console.log(`Syncing: Current=${this.audio.currentTime.toFixed(2)}, Target=${targetPosition.toFixed(2)}, Diff=${timeDifference.toFixed(2)}`);
+            console.log(`Syncing: Current=${this.audio.currentTime.toFixed(2)}, Target=${targetPosition.toFixed(2)}, Diff=${timeDifference.toFixed(2)}, Duration=${this.audio.duration.toFixed(2)}`);
             this.pendingSeek = true;
             this.audio.currentTime = targetPosition;
         }
@@ -268,16 +318,25 @@ class SyncMusicPlayer {
 
     // Broadcast current playback state
     broadcastSync() {
-        if (!this.isHost) return;
+        if (!this.isHost || !this.audio.duration || isNaN(this.audio.duration)) return;
+
+        // 🔧 FIX: Validate position before broadcasting
+        let position = this.audio.currentTime;
+        if (position > this.audio.duration) {
+            position = this.audio.duration - 0.1;
+            this.audio.currentTime = position;
+        }
 
         const syncData = {
             room_id: this.currentRoom,
-            position: this.audio.currentTime,
+            position: position,
             is_playing: !this.audio.paused,
-            timestamp: this.getServerTime()
+            timestamp: this.getServerTime(),
+            duration: this.audio.duration // Include duration for validation
         };
 
         this.socket.emit('sync_playback', syncData);
+        console.log('Broadcasting sync:', syncData);
     }
 
     // Broadcast seek position
