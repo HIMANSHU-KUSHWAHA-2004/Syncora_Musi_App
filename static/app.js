@@ -4,14 +4,7 @@ class SyncMusicPlayer {
         this.currentRoom = null;
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
-        this.audio.playbackRate = 1.0;
-
-        this.syncThreshold = 0.1; // 100ms
-        this.lastSyncTime = 0;
-        this.syncInterval = null;
-        this.pendingSeek = false;
-        this.serverTimeOffset = 0;
-        this.offsetRecalcInterval = null;
+        this.syncThreshold = 0.3; // 300ms sync threshold
 
         this.init();
     }
@@ -19,32 +12,10 @@ class SyncMusicPlayer {
     init() {
         this.setupEventListeners();
         this.setupSocketEvents();
-        this.calculateServerTimeOffset();
-        this.offsetRecalcInterval = setInterval(() => {
-            this.calculateServerTimeOffset();
-        }, 30000);
-    }
-
-    async calculateServerTimeOffset() {
-        try {
-            const start = Date.now();
-            const response = await fetch('/api/time');
-            const end = Date.now();
-            const data = await response.json();
-
-            const networkDelay = (end - start) / 2;
-            this.serverTimeOffset = data.server_time - (start + networkDelay);
-        } catch (error) {
-            console.warn('Could not calculate server time offset:', error);
-            this.serverTimeOffset = 0;
-        }
-    }
-
-    getServerTime() {
-        return Date.now() + this.serverTimeOffset;
     }
 
     setupEventListeners() {
+        // Navigation
         document.getElementById('create-room-btn').addEventListener('click', () => {
             this.showScreen('create-room-screen');
         });
@@ -65,6 +36,7 @@ class SyncMusicPlayer {
             this.leaveRoom();
         });
 
+        // Audio controls
         document.getElementById('play-btn').addEventListener('click', () => {
             this.play();
         });
@@ -73,6 +45,7 @@ class SyncMusicPlayer {
             this.pause();
         });
 
+        // File upload
         document.getElementById('upload-btn').addEventListener('click', () => {
             document.getElementById('file-input').click();
         });
@@ -81,10 +54,9 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
+        // Audio events
         this.audio.addEventListener('loadedmetadata', () => {
             this.updateTimeDisplay();
-            this.audio.playbackRate = 1.0;
-            console.log('Audio metadata loaded, duration:', this.audio.duration);
         });
 
         this.audio.addEventListener('timeupdate', () => {
@@ -92,29 +64,20 @@ class SyncMusicPlayer {
         });
 
         this.audio.addEventListener('seeked', () => {
-            if (this.isHost && !this.pendingSeek) {
-                this.broadcastSeek();
+            if (this.isHost) {
+                this.socket.emit('seek', {
+                    room_id: this.currentRoom,
+                    position: this.audio.currentTime
+                });
             }
-            this.pendingSeek = false;
         });
 
-        this.audio.addEventListener('waiting', () => {
-            console.log('Audio buffering...');
-        });
-
-        this.audio.addEventListener('canplay', () => {
-            console.log('Audio can play');
-        });
-
-        this.audio.addEventListener('error', (e) => {
-            console.error('Audio error:', e);
-            this.showError('Audio playback error occurred');
-        });
-
+        // Error modal
         document.getElementById('close-error-btn').addEventListener('click', () => {
             this.hideModal();
         });
 
+        // Enter key support
         document.getElementById('room-id-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') this.joinRoom();
         });
@@ -133,7 +96,6 @@ class SyncMusicPlayer {
             this.currentRoom = data.room_id;
             this.isHost = data.is_host;
             this.showPlayer();
-            this.startSyncLoop();
         });
 
         this.socket.on('room_joined', (data) => {
@@ -142,15 +104,12 @@ class SyncMusicPlayer {
             this.showPlayer();
 
             if (data.current_song) {
-                this.loadSong(data.current_song).then(() => {
-                    this.audio.addEventListener('canplay', () => {
-                        this.syncToState(data);
-                    }, { once: true });
-                });
-            }
-
-            if (this.isHost) {
-                this.startSyncLoop();
+                this.loadSong(data.current_song);
+                this.audio.currentTime = data.position;
+                if (data.is_playing) {
+                    this.audio.play();
+                    this.updatePlayButton(true);
+                }
             }
         });
 
@@ -159,21 +118,33 @@ class SyncMusicPlayer {
         });
 
         this.socket.on('song_changed', (data) => {
-            this.loadSong(data.song).then(() => {
-                this.audio.addEventListener('canplay', () => {
-                    this.syncToState(data);
-                }, { once: true });
-            });
+            this.loadSong(data.song);
+            this.audio.currentTime = data.position;
+            this.updatePlayButton(data.is_playing);
         });
 
         this.socket.on('sync_playback', (data) => {
-            if (this.isHost) return;
-            this.syncToState(data);
+            const currentTime = Date.now() / 1000;
+            const timeDiff = currentTime - data.timestamp;
+            const expectedPosition = data.position + (data.is_playing ? timeDiff : 0);
+
+            if (Math.abs(this.audio.currentTime - expectedPosition) > this.syncThreshold) {
+                this.audio.currentTime = expectedPosition;
+            }
+
+            if (data.is_playing) {
+                this.audio.play();
+                this.updatePlayButton(true);
+            } else {
+                this.audio.pause();
+                this.updatePlayButton(false);
+            }
         });
 
         this.socket.on('sync_seek', (data) => {
-            this.pendingSeek = true;
-            this.audio.currentTime = data.position;
+            const currentTime = Date.now() / 1000;
+            const timeDiff = currentTime - data.timestamp;
+            this.audio.currentTime = data.position + timeDiff;
         });
 
         this.socket.on('clients_updated', (data) => {
@@ -182,99 +153,8 @@ class SyncMusicPlayer {
         });
 
         this.socket.on('new_host', (data) => {
-            const wasHost = this.isHost;
             this.isHost = data.is_host;
             this.updateHostControls();
-            if (this.isHost && !wasHost) {
-                this.startSyncLoop();
-            } else if (!this.isHost && wasHost) {
-                this.stopSyncLoop();
-            }
-        });
-
-        this.socket.on('disconnect', () => {
-            console.log('Disconnected from server');
-            this.stopSyncLoop();
-        });
-
-        this.socket.on('reconnect', () => {
-            console.log('Reconnected to server');
-            if (this.currentRoom) {
-                this.socket.emit('rejoin_room', { room_id: this.currentRoom });
-            }
-        });
-    }
-
-    syncToState(data) {
-        if (!this.audio.src) return;
-
-        const currentTime = this.getServerTime();
-        let targetPosition = data.position;
-
-        if (data.timestamp && data.is_playing) {
-            const timeDiff = (currentTime - data.timestamp) / 1000;
-            targetPosition += timeDiff;
-        }
-
-        const diff = targetPosition - this.audio.currentTime;
-
-        if (Math.abs(diff) > this.syncThreshold) {
-            this.pendingSeek = true;
-            this.audio.currentTime = targetPosition;
-        } else {
-            if (!this.audio.paused && data.is_playing) {
-                const adjust = diff * 0.05;
-                this.audio.playbackRate = 1.0 + adjust;
-                clearTimeout(this._resetRateTimer);
-                this._resetRateTimer = setTimeout(() => {
-                    this.audio.playbackRate = 1.0;
-                }, 200);
-            }
-        }
-
-        if (data.is_playing && this.audio.paused) {
-            this.audio.play().catch(e => console.error('Play failed:', e));
-            this.updatePlayButton(true);
-        } else if (!data.is_playing && !this.audio.paused) {
-            this.audio.pause();
-            this.updatePlayButton(false);
-        }
-    }
-
-    startSyncLoop() {
-        if (!this.isHost) return;
-        this.stopSyncLoop();
-        this.syncInterval = setInterval(() => {
-            if (this.currentRoom && this.audio.src) {
-                this.broadcastSync();
-            }
-        }, 250);
-    }
-
-    stopSyncLoop() {
-        if (this.syncInterval) {
-            clearInterval(this.syncInterval);
-            this.syncInterval = null;
-        }
-    }
-
-    broadcastSync() {
-        if (!this.isHost) return;
-        const syncData = {
-            room_id: this.currentRoom,
-            position: this.audio.currentTime,
-            is_playing: !this.audio.paused,
-            timestamp: this.getServerTime()
-        };
-        this.socket.emit('sync_playback', syncData);
-    }
-
-    broadcastSeek() {
-        if (!this.isHost) return;
-        this.socket.emit('seek', {
-            room_id: this.currentRoom,
-            position: this.audio.currentTime,
-            timestamp: this.getServerTime()
         });
     }
 
@@ -293,33 +173,46 @@ class SyncMusicPlayer {
     joinRoom() {
         const roomId = document.getElementById('room-id-input').value.trim();
         const password = document.getElementById('room-password-input').value;
+
         if (!roomId) {
             this.showError('Please enter a room ID');
             return;
         }
-        this.socket.emit('join_room', { room_id: roomId, password: password });
+
+        this.socket.emit('join_room', {
+            room_id: roomId,
+            password: password
+        });
     }
 
     leaveRoom() {
-        this.stopSyncLoop();
+        // 🔥 If host, call the cleanup endpoint
         if (this.isHost && this.currentRoom) {
             fetch('/end_session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ room_id: this.currentRoom })
-            }).catch(err => console.error('❌ Error cleaning up session:', err));
+            })
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Cleanup result:', data);
+                })
+                .catch(err => console.error('Error cleaning up session:', err));
         }
 
+        // ✅ Clear local state
         this.currentRoom = null;
         this.isHost = false;
         this.audio.pause();
         this.audio.src = '';
         this.showScreen('home-screen');
 
+        // Clear inputs
         document.getElementById('room-id-input').value = '';
         document.getElementById('room-password-input').value = '';
         document.getElementById('new-room-password').value = '';
     }
+
 
     showPlayer() {
         this.showScreen('player-screen');
@@ -330,6 +223,7 @@ class SyncMusicPlayer {
     updateHostControls() {
         const hostControls = document.getElementById('host-controls');
         const hostBadge = document.getElementById('host-badge');
+
         if (this.isHost) {
             hostControls.style.display = 'block';
             hostBadge.style.display = 'inline';
@@ -341,25 +235,34 @@ class SyncMusicPlayer {
 
     play() {
         if (!this.isHost) return;
-        this.audio.play().then(() => {
-            this.updatePlayButton(true);
-            this.broadcastSync();
-        }).catch(e => {
-            console.error('Play failed:', e);
-            this.showError('Unable to play audio. Please try again.');
+
+        this.audio.play();
+        this.updatePlayButton(true);
+
+        this.socket.emit('play_pause', {
+            room_id: this.currentRoom,
+            is_playing: true,
+            position: this.audio.currentTime
         });
     }
 
     pause() {
         if (!this.isHost) return;
+
         this.audio.pause();
         this.updatePlayButton(false);
-        this.broadcastSync();
+
+        this.socket.emit('play_pause', {
+            room_id: this.currentRoom,
+            is_playing: false,
+            position: this.audio.currentTime
+        });
     }
 
     updatePlayButton(isPlaying) {
         const playBtn = document.getElementById('play-btn');
         const pauseBtn = document.getElementById('pause-btn');
+
         if (isPlaying) {
             playBtn.style.display = 'none';
             pauseBtn.style.display = 'inline-block';
@@ -369,27 +272,9 @@ class SyncMusicPlayer {
         }
     }
 
-    async loadSong(filename) {
-        return new Promise((resolve, reject) => {
-            this.audio.src = `/static/uploads/${filename}`;
-            this.audio.playbackRate = 1.0;
-
-            const onLoad = () => {
-                document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
-                this.audio.removeEventListener('loadeddata', onLoad);
-                this.audio.removeEventListener('error', onError);
-                resolve();
-            };
-
-            const onError = (e) => {
-                this.audio.removeEventListener('loadeddata', onLoad);
-                this.audio.removeEventListener('error', onError);
-                reject(e);
-            };
-
-            this.audio.addEventListener('loadeddata', onLoad);
-            this.audio.addEventListener('error', onError);
-        });
+    loadSong(filename) {
+        this.audio.src = `/static/uploads/${filename}`;
+        document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
     }
 
     updateTimeDisplay() {
@@ -454,8 +339,10 @@ class SyncMusicPlayer {
     hideModal() {
         document.getElementById('error-modal').classList.remove('active');
     }
+
 }
 
+// Initialize the app
 document.addEventListener('DOMContentLoaded', () => {
     new SyncMusicPlayer();
 });
