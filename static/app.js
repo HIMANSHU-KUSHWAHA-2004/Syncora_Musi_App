@@ -4,14 +4,17 @@ class SyncMusicPlayer {
         this.currentRoom = null;
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
-        this.syncThreshold = 0.2; // Reduced to 200ms for better sync
-        this.serverTimeOffset = 0; // Offset between client and server time
-        this.latency = 0; // Network latency
-        this.syncInterval = null; // For periodic sync checks
+        this.syncThreshold = 0.15; // Reduced to 150ms for tighter sync
+        this.serverTimeOffset = 0;
+        this.latency = 0;
+        this.syncInterval = null;
         this.lastSyncTime = 0;
-        this.playStartTime = null; // When the current play session started
-        this.targetPosition = 0; // Target position for sync
-        this.isSyncing = false; // Flag to prevent sync loops
+        this.playStartTime = null;
+        this.targetPosition = 0;
+        this.isSyncing = false;
+        this.syncQueue = []; // Queue for handling rapid sync events
+        this.latencyHistory = []; // Track latency history for smoothing
+        this.maxLatencyHistory = 10;
 
         this.init();
     }
@@ -23,11 +26,11 @@ class SyncMusicPlayer {
         this.syncTimeWithServer();
     }
 
-    // Measure latency to server periodically
+    // Enhanced latency measurement with history tracking
     measureLatencyPeriodically() {
         setInterval(() => {
             this.measureLatency();
-        }, 5000); // Every 5 seconds
+        }, 3000); // Every 3 seconds
     }
 
     measureLatency() {
@@ -36,14 +39,24 @@ class SyncMusicPlayer {
         
         this.socket.once('pong_sync', (data) => {
             const end = performance.now();
-            this.latency = (end - start) / 2; // Round trip time / 2
+            const currentLatency = (end - start) / 2;
             
-            // Update server time offset
+            // Add to history and calculate smoothed latency
+            this.latencyHistory.push(currentLatency);
+            if (this.latencyHistory.length > this.maxLatencyHistory) {
+                this.latencyHistory.shift();
+            }
+            
+            // Use median of recent latency measurements for stability
+            const sortedLatency = [...this.latencyHistory].sort((a, b) => a - b);
+            this.latency = sortedLatency[Math.floor(sortedLatency.length / 2)];
+            
+            // Update server time offset with better precision
             const serverTime = data.server_time;
-            const clientTime = Date.now();
+            const clientTime = performance.now() + performance.timeOrigin;
             this.serverTimeOffset = serverTime - clientTime;
             
-            // Send latency to server
+            // Send smoothed latency to server
             if (this.currentRoom) {
                 this.socket.emit('update_latency', {
                     room_id: this.currentRoom,
@@ -53,91 +66,174 @@ class SyncMusicPlayer {
         });
     }
 
-    // Get server time adjusted for latency
+    // More precise server time calculation
     getServerTime() {
-        return Date.now() + this.serverTimeOffset;
+        return (performance.now() + performance.timeOrigin) + this.serverTimeOffset;
     }
 
-    // Sync time with server on initialization
+    // Enhanced sync time with server
     syncTimeWithServer() {
+        const start = performance.now();
         fetch('/sync_time')
             .then(res => res.json())
             .then(data => {
-                const clientTime = Date.now();
-                this.serverTimeOffset = data.server_time - clientTime;
+                const end = performance.now();
+                const roundTripTime = end - start;
+                const networkDelay = roundTripTime / 2;
+                
+                const clientTime = performance.now() + performance.timeOrigin;
+                this.serverTimeOffset = data.server_time - clientTime - networkDelay;
+                
+                console.log(`Time sync: offset=${this.serverTimeOffset.toFixed(2)}ms, RTT=${roundTripTime.toFixed(2)}ms`);
             })
             .catch(err => console.warn('Failed to sync time with server:', err));
     }
 
-    // Calculate precise position based on server timing
-    calculatePrecisePosition(basePosition, isPlaying, playStartTime) {
+    // Calculate precise position with better algorithm
+    calculatePrecisePosition(basePosition, isPlaying, playStartTime, receivedAt = null) {
         if (!isPlaying || !playStartTime) {
             return basePosition;
         }
         
-        const currentServerTime = this.getServerTime();
-        const elapsed = (currentServerTime - playStartTime) / 1000.0;
+        const referenceTime = receivedAt || this.getServerTime();
+        const elapsed = Math.max(0, (referenceTime - playStartTime) / 1000.0);
         return Math.max(0, basePosition + elapsed);
     }
 
-    // Enhanced sync function with better timing
+    // Enhanced sync function with queue processing and drift correction
     syncToPosition(targetData, forceSync = false) {
-        if (this.isSyncing && !forceSync) return;
+        // Add to sync queue to prevent overwhelming
+        this.syncQueue.push({ targetData, forceSync, timestamp: performance.now() });
         
-        const { position, is_playing, timestamp, play_start_time } = targetData;
+        // Process queue if not already processing
+        if (!this.isSyncing) {
+            this.processSyncQueue();
+        }
+    }
+
+    processSyncQueue() {
+        if (this.syncQueue.length === 0) return;
+        
+        // Get the most recent sync command
+        const { targetData, forceSync } = this.syncQueue.pop();
+        this.syncQueue = []; // Clear queue, only use latest
+        
+        this.isSyncing = true;
+        
+        const { position, is_playing, timestamp, play_start_time, server_position, sync_type } = targetData;
         const currentServerTime = this.getServerTime();
         
-        // Calculate the actual target position accounting for time passed
+        // Calculate target position with network compensation
         let targetPosition = position;
-        if (is_playing && play_start_time) {
+        if (server_position !== undefined) {
+            // Use server-calculated position if available
+            targetPosition = server_position;
+        } else if (is_playing && play_start_time) {
             const elapsed = (currentServerTime - play_start_time) / 1000.0;
             targetPosition = Math.max(0, position + elapsed);
         }
         
-        // Check if we need to sync
-        const timeDiff = Math.abs(this.audio.currentTime - targetPosition);
-        const needsSync = forceSync || timeDiff > this.syncThreshold;
-        
-        if (needsSync) {
-            this.isSyncing = true;
-            
-            // Compensate for latency
+        // Apply latency compensation for playing audio
+        if (is_playing) {
             const latencyCompensation = this.latency / 1000.0;
-            const compensatedPosition = Math.max(0, targetPosition + (is_playing ? latencyCompensation : 0));
-            
-            console.log(`Syncing: current=${this.audio.currentTime.toFixed(2)}, target=${compensatedPosition.toFixed(2)}, diff=${timeDiff.toFixed(2)}`);
-            
-            this.audio.currentTime = compensatedPosition;
-            
-            setTimeout(() => {
-                this.isSyncing = false;
-            }, 100);
+            targetPosition += latencyCompensation;
         }
         
-        // Handle play/pause state
-        if (is_playing && this.audio.paused) {
-            this.audio.play().catch(e => console.warn('Play failed:', e));
+        // Check if sync is needed
+        const currentPosition = this.audio.currentTime;
+        const timeDiff = Math.abs(currentPosition - targetPosition);
+        const needsSync = forceSync || timeDiff > this.syncThreshold;
+        
+        if (needsSync && !this.audio.seeking) {
+            console.log(`${sync_type || 'sync'}: current=${currentPosition.toFixed(3)}s, target=${targetPosition.toFixed(3)}s, diff=${timeDiff.toFixed(3)}s, latency=${this.latency.toFixed(1)}ms`);
+            
+            // Use smooth seeking for small differences, hard seeking for large ones
+            if (timeDiff < 0.5 && sync_type !== 'seek') {
+                this.smoothSeek(targetPosition);
+            } else {
+                this.audio.currentTime = Math.max(0, targetPosition);
+            }
+        }
+        
+        // Handle play/pause state synchronization
+        this.synchronizePlayState(is_playing);
+        
+        // Update tracking variables
+        this.playStartTime = play_start_time;
+        this.lastSyncTime = currentServerTime;
+        
+        // Release sync lock after a short delay
+        setTimeout(() => {
+            this.isSyncing = false;
+            // Process any queued syncs
+            if (this.syncQueue.length > 0) {
+                setTimeout(() => this.processSyncQueue(), 10);
+            }
+        }, 50);
+    }
+
+    // Smooth seeking for minor adjustments
+    smoothSeek(targetPosition) {
+        const currentPosition = this.audio.currentTime;
+        const diff = targetPosition - currentPosition;
+        
+        if (Math.abs(diff) < 0.05) return; // Too small to matter
+        
+        // Adjust playback rate temporarily for smooth correction
+        if (diff > 0) {
+            // Need to speed up
+            this.audio.playbackRate = 1.05;
+        } else {
+            // Need to slow down  
+            this.audio.playbackRate = 0.95;
+        }
+        
+        // Reset to normal speed after correction
+        setTimeout(() => {
+            if (this.audio) {
+                this.audio.playbackRate = 1.0;
+            }
+        }, Math.min(1000, Math.abs(diff) * 2000));
+    }
+
+    // Separate play state synchronization
+    synchronizePlayState(shouldPlay) {
+        if (shouldPlay && this.audio.paused) {
+            this.audio.play().catch(e => {
+                console.warn('Play failed:', e);
+                // Retry play after a short delay
+                setTimeout(() => {
+                    this.audio.play().catch(() => {});
+                }, 100);
+            });
             this.updatePlayButton(true);
-        } else if (!is_playing && !this.audio.paused) {
+        } else if (!shouldPlay && !this.audio.paused) {
             this.audio.pause();
             this.updatePlayButton(false);
         }
-        
-        this.playStartTime = play_start_time;
-        this.lastSyncTime = currentServerTime;
     }
 
-    // Start periodic sync checks
+    // Enhanced periodic sync with drift detection
     startPeriodicSync() {
         if (this.syncInterval) {
             clearInterval(this.syncInterval);
         }
         
         this.syncInterval = setInterval(() => {
-            if (this.currentRoom && !this.isHost) {
-                // Request sync from server if we haven't synced recently
-                const timeSinceLastSync = this.getServerTime() - this.lastSyncTime;
-                if (timeSinceLastSync > 2000) { // 2 seconds
+            if (this.currentRoom && !this.isHost && !this.isSyncing) {
+                // Send sync check with current position
+                const currentPosition = this.audio.currentTime;
+                const currentTime = this.getServerTime();
+                
+                this.socket.emit('sync_check', {
+                    room_id: this.currentRoom,
+                    client_position: currentPosition,
+                    client_time: currentTime
+                });
+                
+                // Also request sync if it's been too long
+                const timeSinceLastSync = currentTime - this.lastSyncTime;
+                if (timeSinceLastSync > 3000) { // 3 seconds
                     this.socket.emit('request_sync', { room_id: this.currentRoom });
                 }
             }
@@ -184,7 +280,7 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
-        // Audio events with improved handling
+        // Enhanced audio event handling
         this.audio.addEventListener('loadedmetadata', () => {
             this.updateTimeDisplay();
         });
@@ -195,19 +291,32 @@ class SyncMusicPlayer {
 
         this.audio.addEventListener('seeked', () => {
             if (this.isHost && !this.isSyncing) {
-                this.socket.emit('seek', {
-                    room_id: this.currentRoom,
-                    position: this.audio.currentTime
-                });
+                // Add small delay to ensure seeking is complete
+                setTimeout(() => {
+                    this.socket.emit('seek', {
+                        room_id: this.currentRoom,
+                        position: this.audio.currentTime
+                    });
+                }, 50);
             }
         });
 
-        // Prevent accidental seeking for non-hosts
+        // Prevent seeking for non-hosts
         this.audio.addEventListener('seeking', (e) => {
             if (!this.isHost && !this.isSyncing) {
                 e.preventDefault();
+                this.audio.currentTime = this.audio.currentTime; // Reset position
                 return false;
             }
+        });
+
+        // Handle audio loading states
+        this.audio.addEventListener('canplay', () => {
+            console.log('Audio ready to play');
+        });
+
+        this.audio.addEventListener('waiting', () => {
+            console.log('Audio buffering...');
         });
 
         // Error modal
@@ -246,12 +355,15 @@ class SyncMusicPlayer {
                 this.loadSong(data.current_song);
                 
                 // Initial sync with precise timing
-                this.syncToPosition({
-                    position: data.position,
-                    is_playing: data.is_playing,
-                    timestamp: data.server_time,
-                    play_start_time: data.last_update
-                }, true);
+                setTimeout(() => {
+                    this.syncToPosition({
+                        position: data.position,
+                        is_playing: data.is_playing,
+                        timestamp: data.server_time,
+                        play_start_time: data.last_update,
+                        sync_type: 'initial'
+                    }, true);
+                }, 100); // Small delay to ensure audio is loaded
             }
             
             this.startPeriodicSync();
@@ -263,14 +375,18 @@ class SyncMusicPlayer {
 
         this.socket.on('song_changed', (data) => {
             this.loadSong(data.song);
-            this.syncToPosition({
-                position: data.position,
-                is_playing: data.is_playing,
-                timestamp: data.timestamp,
-                play_start_time: null
-            }, true);
+            setTimeout(() => {
+                this.syncToPosition({
+                    position: data.position,
+                    is_playing: data.is_playing,
+                    timestamp: data.timestamp,
+                    play_start_time: null,
+                    sync_type: 'song_change'
+                }, true);
+            }, 200); // Wait for song to load
         });
 
+        // Enhanced sync event handlers
         this.socket.on('sync_playback', (data) => {
             console.log('Received sync_playback:', data);
             this.syncToPosition(data);
@@ -286,6 +402,13 @@ class SyncMusicPlayer {
             this.syncToPosition(data, true);
         });
 
+        // New heartbeat sync handler
+        this.socket.on('heartbeat_sync', (data) => {
+            if (!this.isHost && !this.isSyncing) {
+                this.syncToPosition(data);
+            }
+        });
+
         this.socket.on('clients_updated', (data) => {
             document.getElementById('clients-count').textContent =
                 `${data.clients} connected`;
@@ -296,7 +419,7 @@ class SyncMusicPlayer {
             this.updateHostControls();
         });
 
-        // Handle connection issues
+        // Enhanced connection handling
         this.socket.on('disconnect', () => {
             console.warn('Disconnected from server');
             if (this.syncInterval) {
@@ -307,12 +430,13 @@ class SyncMusicPlayer {
         this.socket.on('reconnect', () => {
             console.log('Reconnected to server');
             this.syncTimeWithServer();
+            
             if (this.currentRoom) {
                 this.startPeriodicSync();
                 // Request immediate sync after reconnection
                 setTimeout(() => {
                     this.socket.emit('request_sync', { room_id: this.currentRoom });
-                }, 100);
+                }, 200);
             }
         });
     }
@@ -351,6 +475,9 @@ class SyncMusicPlayer {
             this.syncInterval = null;
         }
 
+        // Clear sync queue
+        this.syncQueue = [];
+
         // If host, call the cleanup endpoint
         if (this.isHost && this.currentRoom) {
             fetch('/end_session', {
@@ -369,6 +496,7 @@ class SyncMusicPlayer {
         this.currentRoom = null;
         this.isHost = false;
         this.playStartTime = null;
+        this.latencyHistory = [];
         this.audio.pause();
         this.audio.src = '';
         this.showScreen('home-screen');
@@ -439,6 +567,7 @@ class SyncMusicPlayer {
 
     loadSong(filename) {
         this.audio.src = `/static/uploads/${filename}`;
+        this.audio.load(); // Force reload
         document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
     }
 
@@ -447,17 +576,19 @@ class SyncMusicPlayer {
         const duration = this.formatTime(this.audio.duration);
         document.getElementById('time-display').textContent = `${current} / ${duration}`;
         
-        // Show sync status for debugging (remove in production)
+        // Enhanced sync status display (remove in production)
         if (!this.isHost) {
             const syncStatus = document.getElementById('sync-status') || this.createSyncStatusElement();
-            syncStatus.textContent = `Latency: ${this.latency.toFixed(0)}ms | Offset: ${this.serverTimeOffset.toFixed(0)}ms`;
+            const avgLatency = this.latencyHistory.length > 0 ? 
+                (this.latencyHistory.reduce((a, b) => a + b) / this.latencyHistory.length).toFixed(0) : 0;
+            syncStatus.textContent = `Lat: ${avgLatency}ms | Off: ${this.serverTimeOffset.toFixed(0)}ms | Q: ${this.syncQueue.length}`;
         }
     }
 
     createSyncStatusElement() {
         const statusElement = document.createElement('div');
         statusElement.id = 'sync-status';
-        statusElement.style.cssText = 'position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 5px; border-radius: 3px; font-size: 12px;';
+        statusElement.style.cssText = 'position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 5px 8px; border-radius: 4px; font-size: 11px; font-family: monospace;';
         document.getElementById('player-screen').appendChild(statusElement);
         return statusElement;
     }
