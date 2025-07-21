@@ -4,9 +4,15 @@ class SyncMusicPlayer {
         this.currentRoom = null;
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
-        this.audio.playbackRate = 1.0; // 🔧 FIX: ensure normal speed initially
-        this.syncThreshold = 0.09; // 300ms sync threshold
-
+        this.audio.playbackRate = 1.0;
+        this.syncThreshold = 0.5; // Increased from 0.09s to 0.5s to reduce frequent syncing
+        
+        // Add sync control flags
+        this.isSyncing = false;
+        this.lastSyncTime = 0;
+        this.syncCooldown = 1000; // 1 second cooldown between syncs
+        this.isManualSeek = false;
+        
         this.init();
     }
 
@@ -55,23 +61,29 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
-        // Audio events
+        // Audio events - Fixed to prevent sync loops
         this.audio.addEventListener('loadedmetadata', () => {
             this.updateTimeDisplay();
-            this.audio.playbackRate = 1.0; // 🔧 FIX: reset speed when metadata loads
+            this.audio.playbackRate = 1.0;
         });
 
         this.audio.addEventListener('timeupdate', () => {
             this.updateTimeDisplay();
         });
 
+        // Fixed: Only emit seek if it's a manual seek, not a sync-induced seek
+        this.audio.addEventListener('seeking', () => {
+            this.isManualSeek = true;
+        });
+
         this.audio.addEventListener('seeked', () => {
-            if (this.isHost) {
+            if (this.isHost && this.isManualSeek && !this.isSyncing) {
                 this.socket.emit('seek', {
                     room_id: this.currentRoom,
                     position: this.audio.currentTime
                 });
             }
+            this.isManualSeek = false;
         });
 
         // Error modal
@@ -107,12 +119,7 @@ class SyncMusicPlayer {
 
             if (data.current_song) {
                 this.loadSong(data.current_song);
-                this.audio.currentTime = data.position;
-                this.audio.playbackRate = 1.0; // 🔧 FIX: force normal speed
-                if (data.is_playing) {
-                    this.audio.play();
-                    this.updatePlayButton(true);
-                }
+                this.syncToPosition(data.position, data.is_playing);
             }
         });
 
@@ -122,31 +129,24 @@ class SyncMusicPlayer {
 
         this.socket.on('song_changed', (data) => {
             this.loadSong(data.song);
-            this.audio.currentTime = data.position;
-            this.audio.playbackRate = 1.0; // 🔧 FIX: force normal speed
-            this.updatePlayButton(data.is_playing);
+            this.syncToPosition(data.position, data.is_playing);
         });
 
+        // Fixed: Better sync handling with debouncing
         this.socket.on('sync_playback', (data) => {
-            // 🔧 FIX: removed timestamp math to avoid drift
-            this.audio.playbackRate = 1.0; // ensure speed
-            if (Math.abs(this.audio.currentTime - data.position) > this.syncThreshold) {
-                this.audio.currentTime = data.position;
+            if (this.isHost) return; // Host shouldn't sync to itself
+            
+            const now = Date.now();
+            if (now - this.lastSyncTime < this.syncCooldown) {
+                return; // Skip sync if within cooldown period
             }
-
-            if (data.is_playing) {
-                this.audio.play();
-                this.updatePlayButton(true);
-            } else {
-                this.audio.pause();
-                this.updatePlayButton(false);
-            }
+            
+            this.syncToPosition(data.position, data.is_playing);
         });
 
         this.socket.on('sync_seek', (data) => {
-            // keep this as is but reset playbackRate
-            this.audio.playbackRate = 1.0; // 🔧 FIX
-            this.audio.currentTime = data.position;
+            if (this.isHost) return; // Host shouldn't sync to itself
+            this.syncToPosition(data.position, null); // Don't change play state on seek
         });
 
         this.socket.on('clients_updated', (data) => {
@@ -158,6 +158,38 @@ class SyncMusicPlayer {
             this.isHost = data.is_host;
             this.updateHostControls();
         });
+    }
+
+    // New method to handle position syncing safely
+    syncToPosition(targetPosition, shouldPlay = null) {
+        if (this.isSyncing) return; // Prevent nested syncing
+        
+        this.isSyncing = true;
+        this.lastSyncTime = Date.now();
+        
+        const timeDiff = Math.abs(this.audio.currentTime - targetPosition);
+        
+        // Only sync if difference is significant
+        if (timeDiff > this.syncThreshold) {
+            this.audio.currentTime = targetPosition;
+        }
+        
+        this.audio.playbackRate = 1.0;
+        
+        if (shouldPlay !== null) {
+            if (shouldPlay && this.audio.paused) {
+                this.audio.play().catch(console.error);
+                this.updatePlayButton(true);
+            } else if (!shouldPlay && !this.audio.paused) {
+                this.audio.pause();
+                this.updatePlayButton(false);
+            }
+        }
+        
+        // Reset sync flag after a short delay
+        setTimeout(() => {
+            this.isSyncing = false;
+        }, 100);
     }
 
     showScreen(screenId) {
@@ -203,6 +235,7 @@ class SyncMusicPlayer {
 
         this.currentRoom = null;
         this.isHost = false;
+        this.isSyncing = false;
         this.audio.pause();
         this.audio.src = '';
         this.showScreen('home-screen');
@@ -234,15 +267,15 @@ class SyncMusicPlayer {
     play() {
         if (!this.isHost) return;
 
-        this.audio.play();
-        this.audio.playbackRate = 1.0; // 🔧 FIX: enforce normal speed
-        this.updatePlayButton(true);
-
-        this.socket.emit('play_pause', {
-            room_id: this.currentRoom,
-            is_playing: true,
-            position: this.audio.currentTime
-        });
+        this.audio.playbackRate = 1.0;
+        this.audio.play().then(() => {
+            this.updatePlayButton(true);
+            this.socket.emit('play_pause', {
+                room_id: this.currentRoom,
+                is_playing: true,
+                position: this.audio.currentTime
+            });
+        }).catch(console.error);
     }
 
     pause() {
@@ -273,7 +306,7 @@ class SyncMusicPlayer {
 
     loadSong(filename) {
         this.audio.src = `/static/uploads/${filename}`;
-        this.audio.playbackRate = 1.0; // 🔧 FIX
+        this.audio.playbackRate = 1.0;
         document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
     }
 
