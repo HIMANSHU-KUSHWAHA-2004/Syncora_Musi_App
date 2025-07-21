@@ -25,7 +25,7 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # ---------------- REDIS -----------------
 def create_redis_connection():
-    redis_url = os.environ.get('REDIS_URL', 'redis://red-d1uhscemcj7s73ehu9d0:jRcdJy754oYW00p8B1w6RwRf3mulP0go@red-d1uhscemcj7s73ehu9d0:6379')
+    redis_url = os.environ.get('REDIS_URL', 'rediss://red-d1uhscemcj7s73ehu9d0:jRcdJy754oYW00p8B1w6RwRf3mulP0go@oregon-keyvalue.render.com:6379')
     if redis_url == 'none':
         return None
     try:
