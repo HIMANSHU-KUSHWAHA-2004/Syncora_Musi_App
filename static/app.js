@@ -5,20 +5,23 @@ class SyncMusicPlayer {
         this.isHost = false;
         this.audio = document.getElementById('audio-player');
         this.audio.playbackRate = 1.0;
-        this.syncThreshold = 0.05; // 50ms sync threshold for tighter sync
+        this.syncThreshold = 0.1; // Increased threshold for stability
         
         // Synchronization state
         this.lastSyncTime = 0;
         this.syncInterval = null;
         this.pendingSeek = false;
         this.serverTimeOffset = 0;
+        this.isAudioReady = false;
         
-        // 🔧 NEW: Track host state for micro-sync
-        this.lastKnownHostPosition = null;
-        this.lastKnownHostTime = null;
-        
-        // Debounce for sync events
+        // Improved sync tracking
+        this.lastHostState = null;
         this.syncDebounceTimeout = null;
+        this.rateAdjustmentTimeout = null;
+        
+        // Buffer management
+        this.syncBuffer = [];
+        this.maxSyncBuffer = 5;
 
         this.init();
     }
@@ -29,46 +32,58 @@ class SyncMusicPlayer {
         this.calculateServerTimeOffset();
     }
 
-    // Calculate server time offset for better sync
+    // Enhanced server time offset calculation
     async calculateServerTimeOffset() {
         try {
             const measurements = [];
             
-            // Take 5 measurements for better accuracy
-            for (let i = 0; i < 5; i++) {
+            // Take 10 measurements for better accuracy
+            for (let i = 0; i < 10; i++) {
                 const start = performance.now();
-                const response = await fetch('/api/time');
+                
+                // Use ping endpoint for faster response
+                const response = await fetch('/api/ping', { 
+                    method: 'GET',
+                    cache: 'no-cache'
+                });
+                
                 const end = performance.now();
                 const data = await response.json();
                 
-                const networkDelay = (end - start) / 2;
+                const rtt = end - start;
+                const networkDelay = rtt / 2;
                 const offset = data.server_time - (start + networkDelay);
-                measurements.push({ offset, delay: end - start });
                 
-                if (i < 4) await new Promise(resolve => setTimeout(resolve, 50));
+                measurements.push({ 
+                    offset, 
+                    rtt,
+                    timestamp: start 
+                });
+                
+                if (i < 9) await new Promise(resolve => setTimeout(resolve, 100));
             }
             
-            // Filter out measurements with high network delays
+            // Filter out high-latency measurements (> 50ms RTT)
             const validMeasurements = measurements
-                .filter(m => m.delay < 100) // Only use measurements under 100ms delay
+                .filter(m => m.rtt < 50)
                 .map(m => m.offset);
             
-            if (validMeasurements.length === 0) {
-                console.warn('All time measurements had high latency, using average');
-                this.serverTimeOffset = measurements.reduce((sum, m) => sum + m.offset, 0) / measurements.length;
-            } else {
+            if (validMeasurements.length >= 3) {
                 // Use median of valid measurements
                 validMeasurements.sort((a, b) => a - b);
                 const mid = Math.floor(validMeasurements.length / 2);
                 this.serverTimeOffset = validMeasurements.length % 2 
                     ? validMeasurements[mid]
                     : (validMeasurements[mid - 1] + validMeasurements[mid]) / 2;
+            } else {
+                // Fallback to average of all measurements
+                this.serverTimeOffset = measurements.reduce((sum, m) => sum + m.offset, 0) / measurements.length;
             }
             
-            console.log('Server time offset calculated:', this.serverTimeOffset.toFixed(2), 'ms from', measurements.length, 'measurements');
+            console.log(`🕐 Server time offset: ${this.serverTimeOffset.toFixed(2)}ms (${validMeasurements.length}/${measurements.length} valid measurements)`);
             
         } catch (error) {
-            console.warn('Could not calculate server time offset:', error);
+            console.warn('⚠️ Could not calculate server time offset:', error);
             this.serverTimeOffset = 0;
         }
     }
@@ -117,25 +132,25 @@ class SyncMusicPlayer {
             this.uploadFile(e.target.files[0]);
         });
 
-        // Audio events
+        // Enhanced audio events
         this.audio.addEventListener('loadedmetadata', () => {
+            this.isAudioReady = true;
             this.updateTimeDisplay();
             this.audio.playbackRate = 1.0;
-            console.log('Audio metadata loaded, duration:', this.audio.duration);
+            console.log('🎵 Audio metadata loaded, duration:', this.audio.duration?.toFixed(2), 's');
+        });
+
+        this.audio.addEventListener('canplaythrough', () => {
+            this.isAudioReady = true;
+            console.log('🎵 Audio ready for playback');
         });
 
         this.audio.addEventListener('timeupdate', () => {
             this.updateTimeDisplay();
             
-            // 🔧 NEW: Micro-sync adjustments for non-host clients
-            if (!this.isHost && this.lastKnownHostPosition) {
-                const expectedTime = this.calculateExpectedPosition();
-                const drift = Math.abs(this.audio.currentTime - expectedTime);
-                
-                if (drift > 0.1 && drift < 0.3) {
-                    // Small drift - use rate adjustment
-                    this.smoothSync(expectedTime);
-                }
+            // Continuous micro-sync for clients
+            if (!this.isHost && this.lastHostState && this.isAudioReady) {
+                this.performMicroSync();
             }
         });
 
@@ -147,15 +162,12 @@ class SyncMusicPlayer {
         });
 
         this.audio.addEventListener('waiting', () => {
-            console.log('Audio buffering...');
-        });
-
-        this.audio.addEventListener('canplay', () => {
-            console.log('Audio can play');
+            console.log('⏳ Audio buffering...');
         });
 
         this.audio.addEventListener('error', (e) => {
-            console.error('Audio error:', e);
+            console.error('❌ Audio error:', e);
+            this.isAudioReady = false;
             this.showError('Audio playback error occurred');
         });
 
@@ -184,29 +196,23 @@ class SyncMusicPlayer {
             this.isHost = data.is_host;
             this.showPlayer();
             this.startSyncLoop();
+            console.log('🏠 Room created:', this.currentRoom);
         });
 
         this.socket.on('room_joined', (data) => {
             this.currentRoom = data.room_id;
             this.isHost = data.is_host;
             this.showPlayer();
+            console.log('🚪 Room joined:', this.currentRoom, 'as', this.isHost ? 'host' : 'client');
 
             if (data.current_song) {
                 this.loadSong(data.current_song).then(() => {
-                    // 🔧 FIX: Add delay and validation before syncing
-                    setTimeout(() => {
-                        if (this.audio.duration && !isNaN(this.audio.duration)) {
-                            this.syncToState(data);
-                        } else {
-                            console.warn('Audio not ready for sync, retrying...');
-                            // Retry sync after audio is loaded
-                            this.audio.addEventListener('loadeddata', () => {
-                                this.syncToState(data);
-                            }, { once: true });
-                        }
-                    }, 200); // Small delay to ensure audio is ready
+                    // Wait for audio to be fully ready before syncing
+                    this.waitForAudioReady().then(() => {
+                        this.syncToState(data);
+                    });
                 }).catch(error => {
-                    console.error('Error loading song:', error);
+                    console.error('❌ Error loading song:', error);
                 });
             }
 
@@ -220,44 +226,48 @@ class SyncMusicPlayer {
         });
 
         this.socket.on('song_changed', (data) => {
+            console.log('🎵 Song changed:', data.song);
             this.loadSong(data.song).then(() => {
-                // 🔧 FIX: Ensure audio is fully loaded before syncing
-                setTimeout(() => {
-                    if (this.audio.duration && !isNaN(this.audio.duration)) {
-                        this.syncToState(data);
-                    }
-                }, 300);
+                this.waitForAudioReady().then(() => {
+                    this.syncToState(data);
+                });
             }).catch(error => {
-                console.error('Error loading new song:', error);
+                console.error('❌ Error loading new song:', error);
             });
         });
 
         this.socket.on('sync_playback', (data) => {
-            if (this.isHost) return; // Host doesn't sync to others
-
-            this.syncToState(data);
+            if (this.isHost) return;
+            
+            // Add to sync buffer for smoother processing
+            this.addToSyncBuffer(data);
         });
 
         this.socket.on('sync_seek', (data) => {
-            // 🔧 FIX: Validate seek position before applying
+            if (!this.isAudioReady || !this.audio.duration) {
+                console.warn('⚠️ Audio not ready for seek');
+                return;
+            }
+
             if (data.position >= 0 && data.position <= this.audio.duration) {
                 this.pendingSeek = true;
                 this.audio.currentTime = data.position;
-                console.log('Synced seek to position:', data.position);
+                console.log('⏭️ Synced seek to:', data.position.toFixed(2), 's');
             } else {
-                console.warn('Invalid seek position received:', data.position, 'Duration:', this.audio.duration);
+                console.warn('⚠️ Invalid seek position:', data.position, '(duration:', this.audio.duration, ')');
             }
         });
 
         this.socket.on('clients_updated', (data) => {
-            document.getElementById('clients-count').textContent =
-                `${data.clients} connected`;
+            document.getElementById('clients-count').textContent = `${data.clients} connected`;
         });
 
         this.socket.on('new_host', (data) => {
             const wasHost = this.isHost;
             this.isHost = data.is_host;
             this.updateHostControls();
+            
+            console.log('👑 Host changed:', this.isHost ? 'You are now host' : 'Host changed to another client');
             
             if (this.isHost && !wasHost) {
                 this.startSyncLoop();
@@ -266,133 +276,222 @@ class SyncMusicPlayer {
             }
         });
 
-        // Handle disconnection
         this.socket.on('disconnect', () => {
-            console.log('Disconnected from server');
+            console.log('🔌 Disconnected from server');
             this.stopSyncLoop();
         });
 
         this.socket.on('reconnect', () => {
-            console.log('Reconnected to server');
+            console.log('🔄 Reconnected to server');
             if (this.currentRoom) {
-                // Rejoin room on reconnect
                 this.socket.emit('rejoin_room', { room_id: this.currentRoom });
             }
         });
     }
 
-    // Sync to a given state from server
+    // Wait for audio to be ready with timeout
+    waitForAudioReady(timeout = 5000) {
+        return new Promise((resolve, reject) => {
+            if (this.isAudioReady && this.audio.duration) {
+                resolve();
+                return;
+            }
+
+            const startTime = Date.now();
+            const checkReady = () => {
+                if (this.isAudioReady && this.audio.duration) {
+                    resolve();
+                } else if (Date.now() - startTime > timeout) {
+                    reject(new Error('Audio ready timeout'));
+                } else {
+                    setTimeout(checkReady, 50);
+                }
+            };
+
+            checkReady();
+        });
+    }
+
+    // Add sync data to buffer for processing
+    addToSyncBuffer(data) {
+        this.syncBuffer.push({
+            ...data,
+            receivedAt: this.getServerTime()
+        });
+
+        // Keep buffer size manageable
+        if (this.syncBuffer.length > this.maxSyncBuffer) {
+            this.syncBuffer.shift();
+        }
+
+        // Process latest sync data
+        this.processSyncBuffer();
+    }
+
+    // Process buffered sync data
+    processSyncBuffer() {
+        if (this.syncBuffer.length === 0 || !this.isAudioReady) return;
+
+        // Use most recent sync data
+        const latestSync = this.syncBuffer[this.syncBuffer.length - 1];
+        this.syncToState(latestSync);
+    }
+
+    // Enhanced sync to state
     syncToState(data) {
-        if (!this.audio.src || !this.audio.duration) return;
+        if (!this.isAudioReady || !this.audio.duration) {
+            console.warn('⚠️ Audio not ready for sync');
+            return;
+        }
+
+        // Store host state for micro-sync
+        this.lastHostState = {
+            position: data.position,
+            isPlaying: data.is_playing,
+            timestamp: data.timestamp || this.getServerTime(),
+            serverTime: this.getServerTime()
+        };
 
         let targetPosition = data.position;
 
-        // 🔧 IMPROVED: More accurate time calculation
+        // Calculate expected position based on time elapsed
         if (data.timestamp && data.is_playing) {
-            const now = performance.now() + this.serverTimeOffset;
-            const timeDiff = (now - data.timestamp) / 1000;
-            
-            // Store for micro-sync calculations
-            this.lastKnownHostPosition = data.position;
-            this.lastKnownHostTime = data.timestamp;
-            
-            // Account for network and processing delays more accurately
-            targetPosition += Math.max(0, timeDiff - 0.02); // Subtract 20ms for processing time
+            const timeSinceSync = (this.getServerTime() - data.timestamp) / 1000;
+            targetPosition += Math.max(0, timeSinceSync - 0.03); // Account for 30ms processing delay
         }
 
-        // Prevent jumping beyond song duration
-        if (targetPosition > this.audio.duration) {
-            console.warn(`Target position ${targetPosition.toFixed(3)} exceeds duration ${this.audio.duration.toFixed(3)}, clamping`);
-            targetPosition = this.audio.duration - 0.1;
-        }
-        
-        if (targetPosition < 0) {
-            targetPosition = 0;
-        }
+        // Clamp to valid range
+        targetPosition = Math.max(0, Math.min(targetPosition, this.audio.duration - 0.1));
 
-        // 🔧 IMPROVED: More sophisticated sync logic
-        const timeDifference = Math.abs(this.audio.currentTime - targetPosition);
-        
-        if (timeDifference > this.syncThreshold) {
-            console.log(`Syncing: Current=${this.audio.currentTime.toFixed(3)}, Target=${targetPosition.toFixed(3)}, Diff=${timeDifference.toFixed(3)}ms`);
+        const currentTime = this.audio.currentTime;
+        const timeDiff = Math.abs(currentTime - targetPosition);
+
+        // Enhanced sync logic
+        if (timeDiff > this.syncThreshold) {
+            console.log(`🔄 Sync needed: ${currentTime.toFixed(2)}s → ${targetPosition.toFixed(2)}s (diff: ${timeDiff.toFixed(3)}s)`);
             
-            // 🔧 NEW: Gradual sync for small differences, immediate for large ones
-            if (timeDifference > 0.5) {
-                // Large difference - immediate sync
-                this.pendingSeek = true;
-                this.audio.currentTime = targetPosition;
+            if (timeDiff > 1.0) {
+                // Large difference - immediate hard sync
+                this.hardSync(targetPosition);
+            } else if (timeDiff > 0.3) {
+                // Medium difference - quick rate adjustment
+                this.quickRateSync(targetPosition);
             } else {
-                // Small difference - use playback rate adjustment for smoother sync
-                this.smoothSync(targetPosition);
+                // Small difference - gradual rate adjustment
+                this.gradualRateSync(targetPosition);
             }
         }
 
         // Sync play state
-        if (data.is_playing && this.audio.paused) {
-            this.audio.play().catch(e => console.error('Play failed:', e));
+        this.syncPlayState(data.is_playing);
+    }
+
+    // Hard sync with immediate seek
+    hardSync(targetPosition) {
+        this.pendingSeek = true;
+        this.audio.currentTime = targetPosition;
+        console.log('⚡ Hard sync to:', targetPosition.toFixed(2), 's');
+    }
+
+    // Quick rate-based sync
+    quickRateSync(targetPosition) {
+        const diff = targetPosition - this.audio.currentTime;
+        const rate = diff > 0 ? 1.15 : 0.85;
+        
+        this.setPlaybackRate(rate, 500);
+        console.log('🏃 Quick rate sync:', rate, 'for', diff.toFixed(3), 's diff');
+    }
+
+    // Gradual rate-based sync
+    gradualRateSync(targetPosition) {
+        const diff = targetPosition - this.audio.currentTime;
+        const rate = diff > 0 ? 1.05 : 0.95;
+        
+        this.setPlaybackRate(rate, 1000);
+        console.log('🚶 Gradual rate sync:', rate, 'for', diff.toFixed(3), 's diff');
+    }
+
+    // Micro-sync for continuous adjustment
+    performMicroSync() {
+        if (!this.lastHostState || this.audio.paused) return;
+
+        const expectedPosition = this.calculateExpectedPosition();
+        const drift = expectedPosition - this.audio.currentTime;
+        const absDrift = Math.abs(drift);
+
+        // Only adjust for small drifts to avoid jarring changes
+        if (absDrift > 0.02 && absDrift < 0.2) {
+            const rate = drift > 0 ? 1.02 : 0.98;
+            this.setPlaybackRate(rate, 200);
+        }
+    }
+
+    // Calculate expected position based on last host state
+    calculateExpectedPosition() {
+        if (!this.lastHostState) return this.audio.currentTime;
+
+        const elapsed = (this.getServerTime() - this.lastHostState.timestamp) / 1000;
+        const expected = this.lastHostState.position + elapsed;
+        
+        return Math.min(expected, this.audio.duration - 0.1);
+    }
+
+    // Set playback rate with automatic reset
+    setPlaybackRate(rate, duration) {
+        if (this.rateAdjustmentTimeout) {
+            clearTimeout(this.rateAdjustmentTimeout);
+        }
+
+        this.audio.playbackRate = rate;
+        
+        this.rateAdjustmentTimeout = setTimeout(() => {
+            this.audio.playbackRate = 1.0;
+            this.rateAdjustmentTimeout = null;
+        }, duration);
+    }
+
+    // Sync play state
+    syncPlayState(shouldPlay) {
+        if (shouldPlay && this.audio.paused) {
+            this.audio.play().catch(e => {
+                console.error('❌ Play failed:', e);
+            });
             this.updatePlayButton(true);
-        } else if (!data.is_playing && !this.audio.paused) {
+        } else if (!shouldPlay && !this.audio.paused) {
             this.audio.pause();
             this.updatePlayButton(false);
         }
     }
 
-    // 🔧 NEW: Calculate where we should be based on last known host state
-    calculateExpectedPosition() {
-        if (!this.lastKnownHostPosition || !this.lastKnownHostTime) {
-            return this.audio.currentTime;
-        }
-        
-        const elapsed = (this.getServerTime() - this.lastKnownHostTime) / 1000;
-        return Math.min(this.lastKnownHostPosition + elapsed, this.audio.duration - 0.1);
-    }
-
-    // 🔧 NEW: Smooth sync using playback rate adjustment
-    smoothSync(targetPosition) {
-        const difference = targetPosition - this.audio.currentTime;
-        
-        if (Math.abs(difference) < 0.02) return; // Too small to matter
-        
-        // Adjust playback rate slightly to catch up/slow down
-        if (difference > 0) {
-            // We're behind, speed up slightly
-            this.audio.playbackRate = 1.05;
-            setTimeout(() => { this.audio.playbackRate = 1.0; }, 200);
-        } else {
-            // We're ahead, slow down slightly
-            this.audio.playbackRate = 0.95;
-            setTimeout(() => { this.audio.playbackRate = 1.0; }, 200);
-        }
-        
-        console.log(`Smooth sync: adjusting rate to ${this.audio.playbackRate} for ${difference.toFixed(3)}s difference`);
-    }
-
-    // Start periodic sync for host
+    // Enhanced sync loop for host
     startSyncLoop() {
         if (!this.isHost) return;
         
-        this.stopSyncLoop(); // Clear any existing loop
+        this.stopSyncLoop();
+        console.log('🔄 Starting sync loop');
         
         this.syncInterval = setInterval(() => {
-            if (this.currentRoom && this.audio.src && !this.audio.paused) {
+            if (this.currentRoom && this.audio.src && this.isAudioReady) {
                 this.broadcastSync();
             }
-        }, 500); // Sync every 500ms for tighter sync
+        }, 250); // More frequent sync (4x per second)
     }
 
     stopSyncLoop() {
         if (this.syncInterval) {
             clearInterval(this.syncInterval);
             this.syncInterval = null;
+            console.log('⏹️ Sync loop stopped');
         }
     }
 
-    // Broadcast current playback state
+    // Enhanced broadcast sync
     broadcastSync() {
-        if (!this.isHost || !this.audio.duration || isNaN(this.audio.duration)) return;
+        if (!this.isHost || !this.isAudioReady || isNaN(this.audio.duration)) return;
 
-        // Validate position before broadcasting
         let position = this.audio.currentTime;
+        
+        // Validate and clamp position
         if (position > this.audio.duration) {
             position = this.audio.duration - 0.1;
             this.audio.currentTime = position;
@@ -402,22 +501,25 @@ class SyncMusicPlayer {
             room_id: this.currentRoom,
             position: position,
             is_playing: !this.audio.paused,
-            timestamp: this.getServerTime(), // Using performance.now() for higher precision
-            duration: this.audio.duration
+            timestamp: this.getServerTime(),
+            duration: this.audio.duration,
+            sync_id: Date.now() // Add unique ID for tracking
         };
 
         this.socket.emit('sync_playback', syncData);
     }
 
-    // Broadcast seek position
     broadcastSeek() {
         if (!this.isHost) return;
 
-        this.socket.emit('seek', {
+        const seekData = {
             room_id: this.currentRoom,
             position: this.audio.currentTime,
             timestamp: this.getServerTime()
-        });
+        };
+
+        this.socket.emit('seek', seekData);
+        console.log('⏭️ Broadcast seek:', seekData.position.toFixed(2), 's');
     }
 
     showScreen(screenId) {
@@ -449,6 +551,14 @@ class SyncMusicPlayer {
 
     leaveRoom() {
         this.stopSyncLoop();
+        this.isAudioReady = false;
+        this.lastHostState = null;
+        this.syncBuffer = [];
+
+        if (this.rateAdjustmentTimeout) {
+            clearTimeout(this.rateAdjustmentTimeout);
+            this.rateAdjustmentTimeout = null;
+        }
 
         if (this.isHost && this.currentRoom) {
             fetch('/end_session', {
@@ -457,16 +567,15 @@ class SyncMusicPlayer {
                 body: JSON.stringify({ room_id: this.currentRoom })
             })
                 .then(res => res.json())
-                .then(data => {
-                    console.log('✅ Cleanup result:', data);
-                })
-                .catch(err => console.error('❌ Error cleaning up session:', err));
+                .then(data => console.log('✅ Cleanup result:', data))
+                .catch(err => console.error('❌ Cleanup error:', err));
         }
 
         this.currentRoom = null;
         this.isHost = false;
         this.audio.pause();
         this.audio.src = '';
+        this.audio.playbackRate = 1.0;
         this.showScreen('home-screen');
 
         document.getElementById('room-id-input').value = '';
@@ -499,9 +608,10 @@ class SyncMusicPlayer {
         this.audio.play().then(() => {
             this.updatePlayButton(true);
             this.broadcastSync();
+            console.log('▶️ Playing');
         }).catch(e => {
-            console.error('Play failed:', e);
-            this.showError('Unable to play audio. Please try again.');
+            console.error('❌ Play failed:', e);
+            this.showError('Unable to play audio. Please check your connection.');
         });
     }
 
@@ -511,6 +621,7 @@ class SyncMusicPlayer {
         this.audio.pause();
         this.updatePlayButton(false);
         this.broadcastSync();
+        console.log('⏸️ Paused');
     }
 
     updatePlayButton(isPlaying) {
@@ -527,25 +638,38 @@ class SyncMusicPlayer {
     }
 
     async loadSong(filename) {
+        this.isAudioReady = false;
+        
         return new Promise((resolve, reject) => {
-            this.audio.src = `/static/uploads/${filename}`;
-            this.audio.playbackRate = 1.0;
-            
-            const onLoad = () => {
-                document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
+            const cleanup = () => {
                 this.audio.removeEventListener('loadeddata', onLoad);
                 this.audio.removeEventListener('error', onError);
+                this.audio.removeEventListener('canplaythrough', onCanPlay);
+            };
+            
+            const onLoad = () => {
+                console.log('📁 Song data loaded:', filename);
+            };
+            
+            const onCanPlay = () => {
+                this.isAudioReady = true;
+                document.getElementById('song-name').textContent = filename.replace(/^\d+_/, '');
+                cleanup();
                 resolve();
+                console.log('✅ Song ready:', filename);
             };
             
             const onError = (e) => {
-                this.audio.removeEventListener('loadeddata', onLoad);
-                this.audio.removeEventListener('error', onError);
+                cleanup();
                 reject(e);
             };
 
             this.audio.addEventListener('loadeddata', onLoad);
+            this.audio.addEventListener('canplaythrough', onCanPlay);
             this.audio.addEventListener('error', onError);
+            
+            this.audio.src = `/static/uploads/${filename}`;
+            this.audio.playbackRate = 1.0;
         });
     }
 
